@@ -1,0 +1,16 @@
+[
+  {
+    "name": "build_not_lecture",
+    "type": "user",
+    "description": "Prefer build-with-me guidance",
+    "content": "Guide in a project-driven build-with-me style rather than long lecture."
+  },
+  {
+    "name": "yolo_analysis_fixed_flow",
+    "type": "feedback",
+    "description": "Use fixed YOLO analysis workflow",
+    "content": "For YOLO architecture analysis, prefer yaml -> tasks.py -> modules -> model.py. Avoid broad repository scanning."
+  }
+
+
+]

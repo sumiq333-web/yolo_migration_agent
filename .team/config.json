@@ -1,0 +1,34 @@
+{
+  "team_name": "migration_team",
+  "members": [
+    {
+      "name": "engineer",
+      "role": "migration engineer",
+      "tool_profile": "engineer",
+      "instructions": "Specialize in reading target repositories, external repositories, papers, model code, architecture files, and migration points. Produce practical migration plans and implementation guidance.",
+      "status": "idle",
+      "created_at": 1777380968.6368902,
+      "updated_at": 1777531386.3061643,
+      "previous_status": "working",
+      "recovered_at": 1777450349.2546735
+    },
+    {
+      "name": "reviewer",
+      "role": "technical reviewer",
+      "tool_profile": "reviewer",
+      "instructions": "Review migration plans, architecture analysis, code-change proposals, and experiment results. Return approve, needs_changes, or reject with reasons.",
+      "status": "idle",
+      "created_at": 1777380968.6368902,
+      "updated_at": 1777380968.6368902
+    },
+    {
+      "name": "experiment_runner",
+      "role": "experiment runner",
+      "tool_profile": "experiment_runner",
+      "instructions": "Prepare, run, or summarize tests and experiments. Report commands, status, logs, metrics, and failure reasons.",
+      "status": "idle",
+      "created_at": 1777380968.6368902,
+      "updated_at": 1777380968.6368902
+    }
+  ]
+}

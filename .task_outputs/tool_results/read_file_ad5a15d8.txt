@@ -1,0 +1,151 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+
+import contextlib
+import pickle
+import re
+import types
+from copy import deepcopy
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+from ultralytics.nn.modules import (
+    AIFI,
+    C1,
+    C2,
+    C2PSA,
+    C3,
+    C3TR,
+    ELAN1,
+    OBB,
+    PSA,
+    SPP,
+    SPPELAN,
+    SPPF,
+    AConv,
+    ADown,
+    Bottleneck,
+    BottleneckCSP,
+    C2f,
+    C2fAttn,
+    C2fCIB,
+    C2fPSA,
+    C3Ghost,
+    C3k2,
+    C3x,
+    CBFuse,
+    CBLinear,
+    Classify,
+    Concat,
+    Conv,
+    Conv2,
+    ConvTranspose,
+    Detect,
+    DWConv,
+    DWConvTranspose2d,
+    Focus,
+    GhostBottleneck,
+    GhostConv,
+    HGBlock,
+    HGStem,
+    ImagePoolingAttn,
+    Pose,
+    RepC3,
+    RepConv,
+    RepNCSPELAN4,
+    RepVGGDW,
+    ResNetLayer,
+    RTDETRDecoder,
+    SCDown,
+    Segment,
+    WorldDetect,
+    v10Detect,
+)
+from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
+from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
+from ultralytics.utils.loss import (
+    E2EDetectLoss,
+    v8ClassificationLoss,
+    v8DetectionLoss,
+    v8OBBLoss,
+    v8PoseLoss,
+    v8SegmentationLoss,
+)
+from ultralytics.utils.ops import make_divisible
+from ultralytics.utils.plotting import feature_visualization
+from ultralytics.utils.torch_utils import (
+    fuse_conv_and_bn,
+    fuse_deconv_and_bn,
+    initialize_weights,
+    intersect_dicts,
+    model_info,
+    scale_img,
+    time_sync,
+)
+from .modules.Addmodule import *
+try:
+    import thop
+except ImportError:
+    thop = None
+
+
+class BaseModel(nn.Module):
+    """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
+
+    def forward(self, x, *args, **kwargs):
+        """
+        Perform forward pass of the model for either training or inference.
+
+        If x is a dict, calculates and returns the loss for training. Otherwise, returns predictions for inference.
+
+        Args:
+            x (torch.Tensor | dict): Input tensor for inference, or dict with image tensor and labels for training.
+            *args (Any): Variable length argument list.
+            **kwargs (Any): Arbitrary keyword arguments.
+
+        Returns:
+            (torch.Tensor): Loss if x is a dict (training), or network predictions (inference).
+        """
+        if isinstance(x, dict):  # for cases of training and validating while training.
+            return self.loss(x, *args, **kwargs)
+        return self.predict(x, *args, **kwargs)
+
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            augment (bool): Augment image during prediction, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        if augment:
+            return self._predict_augment(x)
+        return self._predict_once(x, profile, visualize, embed)
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+... (1046 more lines)

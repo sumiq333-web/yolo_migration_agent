@@ -1,0 +1,10 @@
+{
+  "id": "1c39c223",
+  "command": "python -c \"import time; time.sleep(3); print('bg done')\"",
+  "status": "completed",
+  "started_at": 1777364282.7295022,
+  "finished_at": 1777364285.800047,
+  "result_preview": "bg done",
+  "output_file": "F:\\agent\\yolo_migration_agent\\.runtime-tasks\\1c39c223.log",
+  "return_code": 0
+}

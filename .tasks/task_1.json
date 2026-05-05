@@ -1,0 +1,12 @@
+{
+  "id": 1,
+  "subject": "分析 yolo11.yaml",
+  "description": "",
+  "status": "completed",
+  "blockedBy": [],
+  "blocks": [
+    2,
+    4
+  ],
+  "owner": ""
+}

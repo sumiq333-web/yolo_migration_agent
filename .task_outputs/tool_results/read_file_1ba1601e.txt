@@ -1,0 +1,177 @@
+import torch
+from torch import nn
+
+from ultralytics.nn.modules import C2f, C3, Bottleneck, Conv
+
+
+def conv_relu_bn(in_channel, out_channel, dirate):
+    return nn.Sequential(
+        nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, stride=1, padding=dirate * (3-1) //2,
+                  dilation=dirate),
+        nn.BatchNorm2d(out_channel),
+        nn.ReLU(),
+    )
+
+def conv_relu_bnS(in_channel, out_channel, dirate):
+    return nn.Sequential(
+        nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, stride=1, padding=dirate * (3-1) //2,
+                  dilation=dirate),
+        nn.BatchNorm2d(out_channel),
+        nn.SiLU(),
+    )
+class DConv(nn.Module):
+    def __init__(self, c, d, k=3, s=1):
+        super(DConv, self).__init__()
+        self.dconvs = nn.ModuleList([conv_relu_bn(c,c,r) for r in d])
+
+    def forward(self,x):
+        for dconv in self.dconvs:
+            x = dconv(x)
+        return x
+
+class DConvS(nn.Module):
+    def __init__(self, c, d, k=3, s=1):
+        super(DConvS, self).__init__()
+        self.dconvs = nn.ModuleList([conv_relu_bnS(c,c,r) for r in d])
+
+    def forward(self,x):
+        for dconv in self.dconvs:
+            x = dconv(x)
+        return x
+class CND1(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        # self.conv1 = Conv1(c)
+         # self.conv1 = nn.ModuleList([Conv(c,c) for _ in range(3)])
+        self.conv1 = DConv(c, [1, 3])
+        self.conv2 = DConv(c, [2, 4])
+        self.cv3 = Conv(3 * c, c)
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        return self.cv3(torch.cat((x1, x2,x), 1))
+
+
+
+class CND3(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv1 = DConv(c, [1])
+        self.conv2 = DConv(c, [2])
+        self.conv3 = DConv(c, [4])
+        self.cv3 = Conv(3 * c, c)
+
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        return self.cv3(torch.cat((x3,x1,x2),1))
+
+class CND4(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv1 = DConv(c, [1,3])
+        self.conv2 = DConv(c, [2,4])
+        self.cv3 = Conv(3 * c, c)
+
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        return self.cv3(torch.cat((x ,x1,x2),1))
+
+class CND5(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv1 = DConv(c, [1,3])
+        self.conv2 = DConv(c, [2,4])
+        self.cv3 = Conv(3 * c, c)
+
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        return x+self.cv3(torch.cat((x ,x1,x2),1))
+
+class CND6(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv1 = DConvS(c, [1, 3])
+        self.conv2 = DConvS(c, [2, 4])
+        self.cv3 = Conv(4 * c, c)
+
+    def forward(self,x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv2(x1)
+        return x+self.cv3(torch.cat((x,x1,x2,x3),1))
+
+class CkD(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2,n=1, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            [CND1(self.c)]
+        )
+
+class CkD3(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2,n=1, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            [CND3(self.c)]
+        )
+
+
+class CkD4(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2,n=1, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            [CND4(self.c)]
+        )
+
+class CkD5(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2,n=1, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            [CND5(self.c)]
+        )
+
+class CkD6(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2,n=1, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            [CND6(self.c)]
+        )
+
+class C3k_1(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, k=3 ,shortcut=True, g=1, e=0.5):
+        """Initializes the C3k module with specified channels, number of layers, and configurations."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+class C3k2_1(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, k=3,e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k_1(self.c, self.c, 2, k, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )

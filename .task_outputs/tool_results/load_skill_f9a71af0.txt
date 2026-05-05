@@ -1,0 +1,187 @@
+<skill name="analyze-yolo-architecture">
+# Analyze YOLO Architecture
+
+Analyze architecture only.
+
+Do not:
+- modify source code
+- generate patches
+- run experiments
+- tune hyperparameters
+- optimize performance
+- review unrelated utility scripts
+
+## Default Architecture Path
+
+Start with the default architecture path:
+
+1. target model YAML
+2. model-building logic in `ultralytics/nn/tasks.py`
+3. module definition files needed for modules referenced by the YAML or build path
+4. user-facing model entry such as `ultralytics/models/yolo/model.py`
+
+Use the target YAML as the architecture source of truth.
+
+If the user names a specific model family or task, start from that YAML.
+Examples:
+- `ultralytics/cfg/models/11/yolo11.yaml`
+- `ultralytics/cfg/models/v8/yolov8.yaml`
+- `ultralytics/cfg/models/v10/yolov10n.yaml`
+- matching `-seg`, `-pose`, `-obb`, or `-cls` YAML variants
+
+Do not compare multiple model families unless the user asks for comparison.
+
+Do not expand beyond this path unless one of the following is true:
+- the expected file does not exist
+- the required function or class is not found there
+- the target repo uses a different layout
+- a referenced module is defined elsewhere
+
+If expansion is needed, do a minimal targeted search for the missing function, class, or module name, then continue the same architecture trace.
+
+Do not switch into open-ended repository exploration.
+
+## Main Folder Roles
+
+Explain the responsibility of each main folder before drilling into files.
+
+Use this repo-oriented interpretation:
+
+- `ultralytics/cfg/models/`: model YAML definitions grouped by model family and task variant. This is the architecture declaration layer.
+- `ultralytics/nn/`: model-building logic and task model classes. This is where YAML is converted into a PyTorch model.
+- `ultralytics/nn/modules/`: reusable neural-network modules referenced by YAML or `parse_model`.
+- `ultralytics/nn/modules/conv.py`: basic convolution and tensor-routing modules such as `Conv` and `Concat`.
+- `ultralytics/nn/modules/block.py`: higher-level backbone or neck blocks assembled from simpler layers.
+- `ultralytics/nn/modules/head.py`: prediction heads such as `Detect`, `Segment`, `Pose`, `OBB`, and `Classify`.
+- `ultralytics/nn/modules/transformer.py`: transformer-style blocks used by specific architectures when applicable.
+- `ultralytics/nn/modules/utils.py`: helper functions used inside some advanced modules, such as initialization helpers and deformable-attention utilities. Treat this as support code, not the first-stop file for YAML architecture tracing.
+- `ultralytics/models/yolo/`: user-facing YOLO task entrypoints and task-specific wrappers around the core models.
+
+Do not describe folders vaguely. State what they contribute to architecture analysis.
+
+## Workflow
+
+### 1. Locate the target YAML
+
+Open the target model YAML first.
+
+Extract:
+- task variant
+- `scales`
+- `backbone`
+- `head`
+- final prediction module such as `Detect`, `Segment`, `Pose`, `OBB`, or `Classify`
+
+If the expected YAML directory does not exist, report `repo layout differs from expected ultralytics structure` and do one minimal targeted search for the model YAML location.
+
+### 2. Trace model-building logic
+
+Open `ultralytics/nn/tasks.py`.
+
+Find:
+- `yaml_model_load`
+- the task model class such as `DetectionModel`, `SegmentationModel`, `PoseModel`, `OBBModel`, or `ClassificationModel`
+- `parse_model`
+
+Explain the build path from YAML load to model assembly.
+
+Focus on how `parse_model`:
+- walks `d["backbone"] + d["head"]`
+- resolves module names
+- applies repeats, channels, and scaling
+- builds the layer list and save list
+
+If `ultralytics/nn/tasks.py` does not exist, or the expected task class / `parse_model` logic is not there, report `repo layout differs from expected ultralytics structure` and do one minimal targeted search for:
+- `tasks.py`
+- `parse_model`
+- the task model class that loads model YAML
+
+After finding the replacement file, continue the same architecture trace. Do not broaden the task into general repository exploration.
+
+### 3. Resolve core module definitions
+
+Open only the files needed to explain modules actually used by the target YAML.
+
+Typical mapping:
+- `Conv`, `Concat` -> `ultralytics/nn/modules/conv.py`
+- `C3k2`, `SPPF`, `C2PSA`, other blocks -> `ultralytics/nn/modules/block.py`
+- `Detect`, `Segment`, `Pose`, `OBB`, `Classify` -> `ultralytics/nn/modules/head.py`
+
+Do not scan every class in these files. Read only the definitions needed for the target architecture.
+
+If a referenced module is not defined in the expected file, do one minimal targeted search for that module name, open the defining file, and continue.
+
+### 4. Check the task entry file
+
+Open `ultralytics/models/yolo/model.py`.
+
+Use it to explain:
+- how `YOLO(...)` selects the task model
+- how the entrypoint maps a task to the correct model class
+- where YAML-based construction is reached from the user-facing API
+
+If the file does not exist, report `repo layout differs from expected ultralytics structure` and do one minimal targeted search for the user-facing YOLO model entry.
+
+### 5. Produce the summary
+
+Return a compact analysis with these sections in this order:
+
+1. `relevant folders`
+2. `key files`
+3. `file responsibilities`
+4. `architecture`
+5. `yaml to python mapping`
+6. `ignored scope`
+
+## Output Requirements
+
+The analysis must include:
+
+- what the main visited folders contain and why they matter
+- the key file list
+- the responsibility of each key file
+- how the architecture is split into backbone, neck, and head
+- how the YAML definition maps to Python model construction
+
+In `relevant folders`, explain each folder in architecture terms, not just as a path listing.
+Example:
+- `ultralytics/nn/modules/` contains concrete module implementations used by YAML rows and `parse_model`
+- `ultralytics/nn/modules/utils.py` contains helper math or initialization utilities used by some modules, not the primary architecture declaration
+
+If the YAML has no explicit `neck` section, identify the neck as the feature-fusion path between backbone outputs and the final prediction head.
+
+Do not return a vague repository tour. Return an architecture trace.
+
+## Scope Exclusions
+
+Ignore these unless the user explicitly asks:
+- helper scripts
+- fft or image-processing scripts
+- `runs/`, `logs/`, `outputs/`
+- notebooks
+- temporary experiment files
+- dataset utilities
+- one-off custom scripts unrelated to model assembly
+
+Do not let side files change the analysis direction.
+
+Do not keep expanding the search once the target YAML, build logic file, required module definition files, and user-facing model entry are covered.
+
+If the standard ultralytics path fails, fall back once, relocate the equivalent files, and continue along the same main line.
+
+## Todo Discipline
+
+If using a todo or plan tool, update it only when the main phase changes:
+
+1. target YAML
+2. build logic
+3. module definitions
+4. task entry
+5. summary
+
+Do not churn the todo because of side discoveries.
+
+## Final Check
+
+Before finishing, verify that every must-answer item in `references/analysis-checklist.md` is explicitly covered in the final response.
+</skill>

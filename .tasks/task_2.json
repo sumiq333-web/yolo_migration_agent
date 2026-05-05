@@ -1,0 +1,12 @@
+{
+  "id": 2,
+  "subject": "分析 tasks.py 的 parse_model",
+  "description": "",
+  "status": "completed",
+  "blockedBy": [],
+  "blocks": [
+    3,
+    4
+  ],
+  "owner": ""
+}

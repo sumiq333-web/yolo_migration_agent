@@ -1,0 +1,65 @@
+96:    def forward(self, x, *args, **kwargs):
+114:    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+120:            profile (bool):  Print the computation time of each layer if True, defaults to False.
+121:            visualize (bool): Save the feature maps of the model if True, defaults to False.
+122:            augment (bool): Augment image during prediction, defaults to False.
+132:    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+138:            profile (bool):  Print the computation time of each layer if True, defaults to False.
+139:            visualize (bool): Save the feature maps of the model if True, defaults to False.
+161:    def _predict_augment(self, x):
+169:    def _profile_one_layer(self, m, x, dt):
+194:    def fuse(self, verbose=True):
+224:    def is_fused(self, thresh=10):
+237:    def info(self, detailed=False, verbose=True, imgsz=640):
+248:    def _apply(self, fn):
+266:    def load(self, weights, verbose=True):
+281:    def loss(self, batch, preds=None):
+295:    def init_criterion(self):
+303:    def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True):  # model, input channels, number of classes
+319:        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+320:        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+330:            def _forward(x):
+340:            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+348:    def _predict_augment(self, x):
+366:    def _descale_pred(p, flips, scale, img_size, dim=1):
+376:    def _clip_augmented(self, y):
+387:    def init_criterion(self):
+395:    def __init__(self, cfg="yolov8n-obb.yaml", ch=3, nc=None, verbose=True):
+399:    def init_criterion(self):
+407:    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, verbose=True):
+411:    def init_criterion(self):
+419:    def __init__(self, cfg="yolov8n-pose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+428:    def init_criterion(self):
+436:    def __init__(self, cfg="yolov8n-cls.yaml", ch=3, nc=None, verbose=True):
+441:    def _from_yaml(self, cfg, ch, nc, verbose):
+442:        """Set YOLOv8 model configurations and define the model architecture."""
+452:        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+454:        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+458:    def reshape_outputs(model, nc):
+478:    def init_criterion(self):
+487:    This class is responsible for constructing the RTDETR architecture, defining loss functions, and facilitating both
+503:    def __init__(self, cfg="rtdetr-l.yaml", ch=3, nc=None, verbose=True):
+515:    def init_criterion(self):
+521:    def loss(self, batch, preds=None):
+566:    def predict(self, x, profile=False, visualize=False, batch=None, augment=False, embed=None):
+603:    def __init__(self, cfg="yolov8s-world.yaml", ch=3, nc=None, verbose=True):
+609:    def set_classes(self, text, batch=80, cache_clip_model=True):
+630:    def predict(self, x, profile=False, visualize=False, txt_feats=None, augment=False, embed=None):
+673:    def loss(self, batch, preds=None):
+692:    def __init__(self):
+696:    def forward(self, x, augment=False, profile=False, visualize=False):
+709:def temporary_modules(modules=None, attributes=None):
+762:    def __init__(self, *args, **kwargs):
+766:    def __call__(self, *args, **kwargs):
+774:    def find_class(self, module, name):
+791:def torch_safe_load(weight, safe_only=False):
+870:def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
+908:def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
+911:    args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}))}  # combine model and default args, preferring model args
+934:def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
+951:        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
+1081:def yaml_model_load(path):
+1097:def guess_model_scale(model_path):
+1115:def guess_model_task(model):
+1129:    def cfg2task(cfg):
+1194:        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."

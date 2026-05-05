@@ -1,0 +1,2 @@
+"""Task schema module."""
+

@@ -1,0 +1,9 @@
+{
+  "id": 6,
+  "subject": "Assign reply task to engineer",
+  "description": "Dispatch task to engineer to reply with 'protocol close loop connected.'",
+  "status": "completed",
+  "blockedBy": [],
+  "blocks": [],
+  "owner": ""
+}

@@ -1,0 +1,666 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+
+from agent.message_bus import MessageBus
+from agent.team_tools import ToolProfile
+from agent.tool_runtime import execute_tool_block
+from agent.model_runtime import call_model_with_recovery
+from agent.tool_runtime import execute_tool_block
+from agent.agent_runner import AgentRunner, AgentRunnerConfig
+
+
+class TeammateManager:
+    """
+    Persistent teammate registry and teammate worker loops.
+
+    This version uses a fixed team:
+        engineer
+        reviewer
+        experiment_runner
+
+    The model can wake teammates and send messages.
+    The model cannot create arbitrary new teammates.
+    """
+
+    def __init__(
+            self,
+            *,
+            team_dir: Path,
+            bus: MessageBus,
+            request_store,
+            client,
+            model: str,
+            workdir: Path,
+            tool_profiles: dict[str, ToolProfile],
+            hooks,
+
+            create_model_response_fn,
+            normalize_messages_fn,
+            choose_recovery_fn,
+            new_recovery_state_fn,
+            can_attempt_fn,
+            record_attempt_fn,
+            apply_continue_recovery_fn,
+            apply_compact_recovery_fn,
+            apply_backoff_recovery_fn,
+            compact_fn,
+    ):
+        self.dir = Path(team_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+        self.config_path = self.dir / "config.json"
+        self.bus = bus
+        self.client = client
+        self.model = model
+        self.workdir = Path(workdir)
+        self.tool_profiles = tool_profiles
+        self.hooks = hooks
+
+        self.create_model_response_fn = create_model_response_fn
+        self.normalize_messages_fn = normalize_messages_fn
+        self.choose_recovery_fn = choose_recovery_fn
+        self.new_recovery_state_fn = new_recovery_state_fn
+        self.can_attempt_fn = can_attempt_fn
+        self.record_attempt_fn = record_attempt_fn
+        self.apply_continue_recovery_fn = apply_continue_recovery_fn
+        self.apply_compact_recovery_fn = apply_compact_recovery_fn
+        self.apply_backoff_recovery_fn = apply_backoff_recovery_fn
+        self.compact_fn = compact_fn
+        self.request_store = request_store
+        self.config = self._load_config()
+        self.threads: dict[str, threading.Thread] = {}
+        self.active_request_ids: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Team registry
+    # ------------------------------------------------------------------
+    def _report_tool_errors(self, name: str, executions) -> None:
+        payload = []
+
+        for execution in executions:
+            payload.append(
+                {
+                    "tool": execution.tool_name,
+                    "status": execution.status,
+                    "reason": execution.reason,
+                }
+            )
+
+        self.bus.send(
+            sender=name,
+            to="lead",
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            msg_type="error",
+            extra=self._request_extra_for(name),
+        )
+
+    def _send_text_response_to_lead(self, name: str, member: dict, text: str) -> None:
+        self.bus.send(
+            sender=name,
+            to="lead",
+            content=text,
+            msg_type=self._default_result_type(member),
+            extra=self._request_extra_for(name),
+        )
+
+    def _should_stop_after_teammate_tools(self, executions) -> bool:
+        for execution in executions:
+            if execution.tool_name == "send_message" and execution.status == "executed":
+                return True
+        return False
+
+    def reload_config(self) -> str:
+        self.config = self._load_config()
+        return "Team config reloaded."
+
+    def _is_thread_alive(self, name: str) -> bool:
+        thread = self.threads.get(name)
+        return thread is not None and thread.is_alive()
+
+    def dispatch(
+            self,
+            *,
+            to: str,
+            content: str,
+            msg_type: str = "task_request",
+    ) -> str:
+        member = self._find_member(to)
+
+        if member is None:
+            return f"Error: teammate '{to}' not found."
+
+        if msg_type != "task_request":
+            return f"Error: unsupported dispatch msg_type: {msg_type}"
+
+        kind = self._default_request_kind()
+        protocol = self._protocol_name()
+        existing = self.request_store.find_open_request(
+            to=to,
+            content=content,
+            kind=kind,
+        )
+
+        if existing is not None:
+            request_id = existing["request_id"]
+
+            if member.get("status") == "working" and self._is_thread_alive(to):
+                return (
+                    f"Duplicate dispatch ignored. Existing request_id={request_id}. "
+                    f"Teammate is already working."
+                )
+
+            wake_result = self.wake(to)
+
+            return (
+                f"Duplicate dispatch ignored. Existing request_id={request_id}. "
+                f"{wake_result}"
+            )
+        request = self.request_store.create_request(
+            kind=kind,
+            sender="lead",
+            to=to,
+            content=content,
+            payload={
+                "msg_type": msg_type,
+                "protocol": protocol,
+                "kind": kind,
+            },
+        )
+
+        request_id = request["request_id"]
+
+        send_result = self.bus.send(
+            sender="lead",
+            to=to,
+            content=content,
+            msg_type=msg_type,
+            extra={
+                "request_id": request_id,
+                "protocol": protocol,
+                "kind": kind,
+            },
+        )
+
+        if send_result.startswith("Error:"):
+            self.request_store.fail_request(
+                request_id=request_id,
+                reason=send_result,
+            )
+            return f"Error: dispatch failed for {request_id}. {send_result}"
+
+        if member.get("status") == "working" and self._is_thread_alive(to):
+            return (
+                f"Dispatched {msg_type} to {to} "
+                f"with request_id={request_id}. "
+                f"Teammate is already working."
+            )
+
+        wake_result = self.wake(to)
+
+        return (
+            f"Dispatched {msg_type} to {to} "
+            f"with request_id={request_id}. "
+            f"{wake_result}"
+        )
+
+    #
+    # def _request_kind_from_msg_type(self, msg_type: str) -> str:
+    #     mapping = {
+    #         "task_request": "assignment",
+    #         "review_request": "review",
+    #         "experiment_request": "experiment",
+    #         "message": "message",
+    #     }
+    #     return mapping.get(msg_type, "message")
+
+    def ensure_default_team(self) -> str:
+        defaults = [
+            {
+                "name": "engineer",
+                "role": "migration engineer",
+                "tool_profile": "engineer",
+                "instructions": (
+                    "Specialize in reading target repositories, external repositories, "
+                    "papers, model code, architecture files, and migration points. "
+                    "Produce practical migration plans and implementation guidance."
+                ),
+            },
+            {
+                "name": "reviewer",
+                "role": "technical reviewer",
+                "tool_profile": "reviewer",
+                "instructions": (
+                    "Review migration plans, architecture analysis, code-change proposals, "
+                    "and experiment results. Return approve, needs_changes, or reject with reasons."
+                ),
+            },
+            {
+                "name": "experiment_runner",
+                "role": "experiment runner",
+                "tool_profile": "experiment_runner",
+                "instructions": (
+                    "Prepare, run, or summarize tests and experiments. Report commands, "
+                    "status, logs, metrics, and failure reasons."
+                ),
+            },
+        ]
+
+        created = []
+        updated = []
+
+        for item in defaults:
+            member = self._find_member(item["name"])
+
+            if member is None:
+                self.config["members"].append(
+                    {
+                        **item,
+                        "status": "idle",
+                        "created_at": time.time(),
+                        "updated_at": time.time(),
+                    }
+                )
+                created.append(item["name"])
+                continue
+
+            changed = False
+
+            for key in ("role", "tool_profile", "instructions"):
+                if member.get(key) != item[key]:
+                    member[key] = item[key]
+                    changed = True
+
+            if member.get("status") not in {"idle", "working", "shutdown"}:
+                member["status"] = "idle"
+                changed = True
+
+            if changed:
+                member["updated_at"] = time.time()
+                updated.append(item["name"])
+
+        self._save_config()
+
+        parts = []
+        if created:
+            parts.append(f"created={created}")
+        if updated:
+            parts.append(f"updated={updated}")
+
+        if not parts:
+            return "Default migration team already exists."
+
+        return "Default migration team initialized: " + ", ".join(parts)
+
+    def list_all(self) -> str:
+        members = self.config.get("members", [])
+
+        if not members:
+            return "No teammates."
+
+        lines = [f"Team: {self.config.get('team_name', 'migration_team')}"]
+
+        for member in members:
+            lines.append(
+                f"- {member['name']} "
+                f"({member['role']}, profile={member.get('tool_profile', '')}): "
+                f"{member['status']}"
+            )
+
+        return "\n".join(lines)
+
+    def member_names(self) -> list[str]:
+        return [
+            member["name"]
+            for member in self.config.get("members", [])
+            if member.get("status") != "shutdown"
+        ]
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def wake(self, name: str) -> str:
+        name = name.strip()
+        member = self._find_member(name)
+
+        if member is None:
+            return f"Error: teammate '{name}' not found."
+
+        if member.get("status") == "working":
+            if self._is_thread_alive(name):
+                return f"Teammate '{name}' is already working."
+
+            member["status"] = "idle"
+            member["previous_status"] = "working"
+            member["recovered_at"] = time.time()
+            member["updated_at"] = time.time()
+            self._save_config()
+
+        if member.get("status") == "shutdown":
+            member["status"] = "idle"
+
+        member["status"] = "working"
+        member["updated_at"] = time.time()
+        self._save_config()
+
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name,),
+            daemon=True,
+        )
+        self.threads[name] = thread
+        thread.start()
+
+        return f"Woke teammate '{name}'."
+
+    def shutdown(self, name: str) -> str:
+        name = name.strip()
+        member = self._find_member(name)
+
+        if member is None:
+            return f"Error: teammate '{name}' not found."
+
+        member["status"] = "shutdown"
+        member["updated_at"] = time.time()
+        self._save_config()
+
+        self.bus.send(
+            sender="lead",
+            to=name,
+            content="Shutdown requested. Finish current step and stop.",
+            msg_type="shutdown_request",
+        )
+
+        return f"Shutdown requested for teammate '{name}'."
+
+    # ------------------------------------------------------------------
+    # Teammate loop
+    # ------------------------------------------------------------------
+
+    def _teammate_loop(self, name: str) -> None:
+        member = self._find_member(name)
+        if member is None:
+            return
+
+        messages: list[dict] = []
+
+        try:
+            while True:
+                member = self._find_member(name)
+                if member is None:
+                    break
+
+                if member.get("status") == "shutdown":
+                    break
+
+                inbox = self.bus.read_inbox(name)
+
+                if not inbox and not messages:
+                    break
+
+                for message in inbox:
+                    request_id = message.get("request_id")
+                    if request_id:
+                        self.active_request_ids[name] = request_id
+
+                    if message.get("type") == "shutdown_request":
+                        self.bus.send(
+                            sender=name,
+                            to="lead",
+                            content="Shutdown acknowledged.",
+                            msg_type="shutdown_response",
+                        )
+                        self._set_status(name, "shutdown")
+                        return
+
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "<teammate-inbox-message>\n"
+                                f"{json.dumps(message, ensure_ascii=False, indent=2)}\n"
+                                "</teammate-inbox-message>"
+                            ),
+                        }
+                    )
+
+                runner = AgentRunner(
+                    AgentRunnerConfig(
+                        name=name,
+                        tools=self._tools_for_member(member),
+                        tool_handlers=self._handlers_for_member(member),
+                        hooks=self.hooks,
+                        system_prompt_fn=lambda member=member: self._build_teammate_system_prompt(member),
+
+                        create_model_response_fn=self.create_model_response_fn,
+                        normalize_messages_fn=self.normalize_messages_fn,
+                        choose_recovery_fn=self.choose_recovery_fn,
+                        new_recovery_state_fn=self.new_recovery_state_fn,
+                        can_attempt_fn=self.can_attempt_fn,
+                        record_attempt_fn=self.record_attempt_fn,
+                        apply_continue_recovery_fn=self.apply_continue_recovery_fn,
+                        apply_compact_recovery_fn=self.apply_compact_recovery_fn,
+                        apply_backoff_recovery_fn=self.apply_backoff_recovery_fn,
+                        compact_fn=self.compact_fn,
+
+                        max_tokens=4000,
+                        tool_actor=name,
+                        prompt_dirty_fn=None,
+                        log_fn=print,
+
+                        stop_after_tool_fn=self._should_stop_after_teammate_tools,
+                        on_text_response_fn=lambda text, name=name, member=member: (
+                            self._send_text_response_to_lead(name, member, text)
+                        ),
+                        on_tool_errors_fn=lambda executions, name=name: (
+                            self._report_tool_errors(name, executions)
+                        ),
+                    )
+                )
+
+                runner_result = runner.run(messages)
+                messages = runner_result.messages
+
+                break
+
+        except Exception as e:
+            self.bus.send(
+                sender=name,
+                to="lead",
+                content=f"Teammate loop error: {e}",
+                msg_type="error",
+            )
+
+
+        finally:
+
+            self.active_request_ids.pop(name, None)
+
+            member = self._find_member(name)
+
+            if member and member.get("status") != "shutdown":
+                self._set_status(name, "idle")
+
+    # ------------------------------------------------------------------
+    # Tool routing
+    # ------------------------------------------------------------------
+
+    def _tools_for_member(self, member: dict) -> list[dict]:
+        profile_name = member.get("tool_profile", "")
+        profile = self.tool_profiles.get(profile_name)
+
+        if profile is None:
+            return []
+
+        return profile.tools
+
+    def _handlers_for_member(self, member: dict) -> dict:
+        profile_name = member.get("tool_profile", "")
+        profile = self.tool_profiles.get(profile_name)
+
+        if profile is None:
+            return {}
+
+        handlers = dict(profile.handlers)
+
+        if "send_message" in handlers:
+            handlers["send_message"] = self._build_send_message_handler(member)
+
+        return handlers
+
+    def _build_send_message_handler(self, member: dict):
+        def send_message(sender: str, **kw) -> str:
+            content = kw.get("content", "")
+            to = kw.get("to", "lead")
+
+            extra = self._request_extra_for(sender)
+            has_active_request = bool(extra)
+
+            msg_type = kw.get("msg_type") or self._default_result_type(member)
+
+            if has_active_request and msg_type == "message":
+                msg_type = self._default_result_type(member)
+
+            return self.bus.send(
+                sender=sender,
+                to=to,
+                content=content,
+                msg_type=msg_type,
+                extra=extra,
+            )
+
+        return send_message
+
+    def _exec_tool_for_member(self, member: dict, tool_name: str, args: dict) -> str:
+        profile_name = member.get("tool_profile", "")
+        profile = self.tool_profiles.get(profile_name)
+
+        if profile is None:
+            return f"Error: unknown tool profile '{profile_name}'."
+
+        handler = profile.handlers.get(tool_name)
+
+        if handler is None:
+            return f"Error: tool '{tool_name}' is not allowed for profile '{profile_name}'."
+
+        try:
+            return str(handler(member["name"], **args))
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------
+    # Prompting
+    # ------------------------------------------------------------------
+
+    def _build_teammate_system_prompt(self, member: dict) -> str:
+        return f"""
+    You are '{member['name']}', role: {member['role']}, at {self.workdir}.
+
+    Standing instructions:
+    {member.get('instructions', '').strip()}
+
+    You are a persistent teammate with your own inbox.
+    Use your available tools to complete assigned inbox messages.
+
+    Protocol rules:
+    - Messages with request_id are tracked protocol messages.
+    - If you complete a tracked assignment, send the final answer to lead with msg_type=task_result.
+    - If you cannot complete a tracked assignment, send msg_type=error and include the failure reason.
+    - Do not use msg_type=message for a tracked request final response.
+    - Use msg_type=message only for ordinary non-tracked communication.
+    - Do not invent request_id. The runtime attaches request_id automatically when needed.
+    """.strip()
+
+    def _default_result_type(self, member: dict) -> str:
+        profile = member.get("tool_profile")
+
+        if profile == "reviewer":
+            return "review_result"
+
+        if profile == "experiment_runner":
+            return "experiment_result"
+
+        return "task_result"
+
+    def _extract_text(self, content) -> str:
+        parts = []
+
+        for block in content:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Config helpers
+    # ------------------------------------------------------------------
+
+    def _load_config(self) -> dict:
+        if not self.config_path.exists():
+            return {
+                "team_name": "migration_team",
+                "members": [],
+            }
+
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {
+                "team_name": "migration_team",
+                "members": [],
+            }
+
+        data.setdefault("team_name", "migration_team")
+        data.setdefault("members", [])
+
+        for member in data["members"]:
+            if "prompt" in member and "instructions" not in member:
+                member["instructions"] = member.pop("prompt")
+            member.setdefault("status", "idle")
+            member.setdefault("tool_profile", member.get("name", "engineer"))
+
+        return data
+
+    def _save_config(self) -> None:
+        self.config_path.write_text(
+            json.dumps(self.config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _find_member(self, name: str) -> dict | None:
+        for member in self.config.get("members", []):
+            if member.get("name") == name:
+                return member
+        return None
+
+    def _set_status(self, name: str, status: str) -> None:
+        member = self._find_member(name)
+
+        if member is None:
+            return
+
+        member["status"] = status
+        member["updated_at"] = time.time()
+        self._save_config()
+
+    def _protocol_name(self) -> str:
+        return "team_request_v1"
+
+    def _default_request_kind(self) -> str:
+        return "assignment"
+
+    def _request_extra_for(self, name: str) -> dict:
+        request_id = self.active_request_ids.get(name)
+        if not request_id:
+            return {}
+
+        return {
+            "request_id": request_id,
+            "protocol": self._protocol_name(),
+            "kind": self._default_request_kind(),
+        }
