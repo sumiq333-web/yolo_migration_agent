@@ -276,12 +276,26 @@ def run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+        cwd = STATE.get("yolo_path") or WORKDIR
+        r = subprocess.run(command, shell=True, cwd=cwd,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
+
+
+def run_python(code: str) -> str:
+    cwd = STATE.get("yolo_path") or WORKDIR
+    try:
+        r = subprocess.run(
+            ["python", "-c", code],
+            capture_output=True, text=True, timeout=30, cwd=cwd,
+        )
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (30s)"
 
 
 def run_read(path: str, limit: int = None) -> str:
@@ -296,9 +310,11 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, create: bool = False) -> str:
     try:
         fp = resolve_workspace_path(path)
+        if not fp.exists() and not create:
+            return f"Error: file does not exist: {path}. Set create=True only if the task explicitly asks to create a new file."
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"

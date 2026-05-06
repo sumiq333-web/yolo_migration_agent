@@ -4,9 +4,10 @@ from pathlib import Path
 from typing import Literal
 
 
-TaskStatus = Literal["pending", "in_progress", "completed", "deleted"]
+TaskStatus = Literal["pending", "in_progress", "blocked", "failed", "completed", "deleted"]
 
-VALID_STATUSES = {"pending", "in_progress", "completed", "deleted"}
+VALID_STATUSES = {"pending", "in_progress", "blocked", "failed", "completed", "deleted"}
+TODO_STATUSES = {"pending", "in_progress", "completed", "failed", "blocked", "skipped"}
 
 
 @dataclass
@@ -19,6 +20,9 @@ class TaskRecord:
     blocks: list[int] = field(default_factory=list)
     owner: str = ""
     todos: list[dict] = field(default_factory=list)
+    workspace: str = ""
+    cwd: str = ""
+    allowed_roots: list[str] = field(default_factory=list)
 
     def is_ready(self) -> bool:
         return self.status == "pending" and not self.blockedBy
@@ -135,10 +139,14 @@ class TaskManager:
         task = self._load(task_id)
 
         if status == "completed" and task.todos:
-            undone = [t for t in task.todos if t["status"] != "completed"]
+            undone = [t for t in task.todos if t["status"] not in ("completed", "skipped")]
+            broken = [t for t in task.todos if t["status"] in ("failed", "blocked")]
             if undone:
-                items = ", ".join(f"#{i}: {t['content']}" for i, t in enumerate(undone))
-                raise ValueError(f"Cannot complete: {len(undone)} todo(s) not done: {items}")
+                items = ", ".join(f"#{i}({t['status']}): {t['content']}" for i, t in enumerate(undone))
+                hint = ""
+                if broken:
+                    hint = f" ({len(broken)} broken — fix or skip them first)"
+                raise ValueError(f"Cannot complete: {len(undone)} todo(s) not resolved: {items}{hint}")
 
         task.status = status  # type: ignore[assignment]
         self._save(task)
@@ -148,6 +156,23 @@ class TaskManager:
 
         return self._to_public(self._load(task_id))
 
+    def set_workspace(self, task_id: int, path: str) -> dict:
+        p = Path(path).expanduser().resolve()
+        if not p.exists() or not p.is_dir():
+            raise ValueError(f"Workspace does not exist or is not a directory: {p}")
+        task = self._load(task_id)
+        task.workspace = str(p)
+        task.cwd = str(p)
+        task.allowed_roots = [str(p)]
+        self._save(task)
+        # Also activate for the current process (lead or teammate)
+        from agent.state import STATE
+        STATE["yolo_path"] = str(p)
+        root_str = str(p)
+        if root_str not in STATE["workspace_roots"]:
+            STATE["workspace_roots"].append(root_str)
+        return self._to_public(task)
+
     def set_todos(self, task_id: int, todos: list[dict]) -> dict:
         task = self._load(task_id)
         for i, item in enumerate(todos):
@@ -155,19 +180,21 @@ class TaskManager:
             status = str(item.get("status", "pending")).lower()
             if not content:
                 raise ValueError(f"Todo {i}: content required")
-            if status not in ("pending", "in_progress", "completed"):
+            if status not in TODO_STATUSES:
                 raise ValueError(f"Todo {i}: invalid status '{status}'")
         task.todos = todos
         self._save(task)
         return self._to_public(task)
 
-    def update_todo_item(self, task_id: int, index: int, status: str) -> dict:
+    def update_todo_item(self, task_id: int, index: int, status: str, reason: str = "") -> dict:
         task = self._load(task_id)
         if index < 0 or index >= len(task.todos):
             raise ValueError(f"Todo index {index} out of range")
-        if status not in ("pending", "in_progress", "completed"):
+        if status not in TODO_STATUSES:
             raise ValueError(f"Invalid todo status: {status}")
         task.todos[index]["status"] = status
+        if reason:
+            task.todos[index]["reason"] = reason
         self._save(task)
         return self._to_public(task)
 
@@ -331,6 +358,8 @@ class TaskManager:
             marker = {
                 "pending": "[ ]",
                 "in_progress": "[>]",
+                "blocked": "[!]",
+                "failed": "[X]",
                 "completed": "[x]",
                 "deleted": "[-]",
             }.get(task.status, "[?]")

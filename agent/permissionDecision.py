@@ -11,6 +11,7 @@ class PermissionDecision(TypedDict):
 READ_ONLY_TOOLS = {
     "read_file",
     "read_code",
+    "run_python",
     "load_skill",
     "todo",
     "set_yolo_workspace",
@@ -34,6 +35,7 @@ READ_ONLY_TOOLS = {
 LOW_RISK_STATE_TOOLS = {
     "task_create_graph",
     "task_set_status",
+    "task_set_workspace",
     "task_set_todos",
     "todo_update",
     "cron_create",
@@ -52,7 +54,7 @@ LOW_RISK_STATE_TOOLS = {
 MUTATING_TOOLS = {
     "write_file",
     "edit_file",
-    "bash",
+    "run_shell",
     "task",
 }
 

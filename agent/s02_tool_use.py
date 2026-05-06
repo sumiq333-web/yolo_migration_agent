@@ -20,6 +20,7 @@ from tools.common_tool import (
     todo_note_round_without_update,
     todo_reminder,
     run_bash,
+    run_python,
     run_read,
     run_read_code,
     todo_update,
@@ -124,7 +125,10 @@ TEAM_TOOL_PROFILES = {
         write_file_fn=run_write,
         edit_file_fn=run_edit,
         scan_yolo_fn=scan_yolo_project,
+        bash_fn=run_bash,
+        run_python_fn=run_python,
         task_manager=TASK_MANAGER,
+        get_task_id_fn=lambda name: TEAM_MANAGER.get_active_task_id(name),
     ),
     "reviewer": build_reviewer_profile(
         bus=TEAM_BUS,
@@ -133,7 +137,10 @@ TEAM_TOOL_PROFILES = {
         write_file_fn=run_write,
         edit_file_fn=run_edit,
         scan_yolo_fn=scan_yolo_project,
+        bash_fn=run_bash,
+        run_python_fn=run_python,
         task_manager=TASK_MANAGER,
+        get_task_id_fn=lambda name: TEAM_MANAGER.get_active_task_id(name),
     ),
     "experiment_runner": build_experiment_runner_profile(
         bus=TEAM_BUS,
@@ -143,6 +150,7 @@ TEAM_TOOL_PROFILES = {
         write_file_fn=run_write,
         edit_file_fn=run_edit,
         task_manager=TASK_MANAGER,
+        get_task_id_fn=lambda name: TEAM_MANAGER.get_active_task_id(name),
     ),
 }
 
@@ -179,6 +187,11 @@ def _handle_dispatch(kw: dict) -> str:
     to = kw["to"]
     if task_id is not None:
         try:
+            task = TASK_MANAGER.get(int(task_id))
+            if not task.get("workspace"):
+                return "Error: cannot dispatch task without workspace. Call task_set_workspace first."
+            if not task.get("todos"):
+                return "Error: cannot dispatch task without todos. Call task_set_todos first."
             TASK_MANAGER.assign(int(task_id), to)
             TASK_MANAGER.set_status(int(task_id), "in_progress")
         except ValueError as e:
@@ -203,6 +216,9 @@ def _build_dispatch_content(kw: dict) -> str:
     header = {
         "task_id": task["id"],
         "subject": task["subject"],
+        "workspace": task.get("workspace", ""),
+        "cwd": task.get("cwd", task.get("workspace", "")),
+        "allowed_roots": task.get("allowed_roots", []),
         "todos": task.get("todos", []),
     }
     return (
@@ -218,9 +234,10 @@ def auto_compact_for_recovery(messages: list) -> list:
     return compacted_messages
 
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
+    "run_shell":  lambda **kw: run_bash(kw["command"]),
+    "run_python": lambda **kw: run_python(kw["code"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw.get("create", False)),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "scan_paper": lambda **kw: paper_tools(),
     "scan_yolo_project": lambda **kw: scan_yolo_project(kw["path"]),
@@ -252,6 +269,10 @@ TOOL_HANDLERS = {
     "task_set_status": lambda **kw: TASK_MANAGER.set_status(
         kw["id"],
         kw["status"],
+    ),
+    "task_set_workspace": lambda **kw: json.dumps(
+        TASK_MANAGER.set_workspace(kw["task_id"], kw["path"]),
+        ensure_ascii=False, indent=2,
     ),
     "task_set_todos": lambda **kw: json.dumps(
         TASK_MANAGER.set_todos(kw["task_id"], kw["todos"]),
@@ -316,12 +337,14 @@ STABLE_PROMPT_MUTATION_TOOLS = {
     # 以后如果你支持动态增删 skill、改 instruction 文件，也加进来
 }
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "run_shell", "description": "Run a shell command. On Windows this runs under cmd.exe. Use Windows-compatible syntax (dir, type, echo, python). For Linux commands like cat/grep use python instead.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "run_python", "description": "Run a Python code snippet. Use this for YAML validation, file inspection, or quick checks. No shell involved — safe and reliable on all platforms.",
+     "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}},
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "write_file", "description": "Write content to file. Only existing files unless create=True.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "create": {"type": "boolean"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 {
@@ -553,11 +576,23 @@ TOOLS = [
     },
 },
 {
+    "name": "task_set_workspace",
+    "description": "Set the YOLO workspace root for a task. Required before dispatching. The path must exist and be a directory.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "integer"},
+            "path": {"type": "string"},
+        },
+        "required": ["task_id", "path"],
+    },
+},
+{
     "name": "task_set_todos",
     "description": (
         "Set the todo list for a task. "
         "Use this before dispatching a task to a teammate. "
-        "Each todo item needs content, status (pending/in_progress/completed), and activeForm."
+        "Each todo item needs content, status (pending/in_progress/completed/failed/blocked/skipped), and activeForm."
     ),
     "input_schema": {
         "type": "object",
@@ -571,7 +606,7 @@ TOOLS = [
                         "content": {"type": "string"},
                         "status": {
                             "type": "string",
-                            "enum": ["pending", "in_progress", "completed"],
+                            "enum": ["pending", "in_progress", "completed", "failed", "blocked", "skipped"],
                         },
                         "activeForm": {"type": "string"},
                     },

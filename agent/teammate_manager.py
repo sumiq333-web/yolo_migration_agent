@@ -74,6 +74,7 @@ class TeammateManager:
         self.config = self._load_config()
         self.threads: dict[str, threading.Thread] = {}
         self.active_request_ids: dict[str, str] = {}
+        self._active_task_ids: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Team registry
@@ -428,6 +429,8 @@ class TeammateManager:
                         }
                     )
 
+                self._activate_task_workspace(inbox, name)
+
                 runner = AgentRunner(
                     AgentRunnerConfig(
                         name=name,
@@ -465,7 +468,16 @@ class TeammateManager:
                 runner_result = runner.run(messages)
                 messages = runner_result.messages
 
-                if runner_result.stop_reason == "stopped_after_tool":
+                if runner_result.stop_reason in ("stopped_after_tool",):
+                    break
+
+                if "exhausted" in runner_result.stop_reason or runner_result.stop_reason in ("empty_response",):
+                    self.bus.send(
+                        sender=name,
+                        to="lead",
+                        content=f"Teammate loop stopped: {runner_result.stop_reason}",
+                        msg_type="error",
+                    )
                     break
 
         except Exception as e:
@@ -570,12 +582,17 @@ class TeammateManager:
     Protocol rules:
     - Messages with request_id are tracked protocol messages.
     - The dispatch message may contain a <task-context> block with a "todos" list. This is your work plan. Work through each todo item in order.
-    - Use todo_update to mark each todo item: set in_progress before starting, then completed when finished.
+    - Use todo_update to mark each todo item: set in_progress before starting, then completed when finished. If a step cannot be done, set blocked or failed with a reason.
     - If you complete ALL todos for the task, send the final answer to lead with msg_type=task_result. Sending task_result ends this work session.
     - If you cannot complete a tracked assignment, send msg_type=error and include the failure reason.
     - Do not use msg_type=message for a tracked request final response.
-    - Use msg_type=message only for ordinary non-tracked communication.
+    - Use msg_type=message only for ordinary non-tracked communication or to ask the lead a question mid-work.
     - Do not invent request_id. The runtime attaches request_id automatically when needed.
+
+    Tool behavior notes:
+    - run_shell on Windows runs cmd.exe. Use dir / type / echo / python. Avoid cat, grep, heredoc.
+    - write_file requires create=True to make a new file. Otherwise the file must already exist.
+    - When validating a YOLO model YAML, it must be a dict with keys: nc, backbone, head. Empty/comment-only files are NOT valid.
     """.strip()
 
     def _default_result_type(self, member: dict) -> str:
@@ -653,6 +670,29 @@ class TeammateManager:
 
     def _protocol_name(self) -> str:
         return "team_request_v1"
+
+    def _activate_task_workspace(self, inbox: list[dict], actor: str) -> None:
+        import re
+        for msg in inbox:
+            content = msg.get("content", "")
+            m = re.search(r"<task-context>(.*?)</task-context>", content, re.DOTALL)
+            if not m:
+                continue
+            try:
+                ctx = json.loads(m.group(1))
+                workspace = ctx.get("workspace", "")
+                task_id = ctx.get("task_id")
+                if task_id is not None:
+                    self._active_task_ids[actor] = int(task_id)
+                if workspace:
+                    from tools.yolo_tools import set_yolo_workspace
+                    set_yolo_workspace(workspace)
+                    print(f"  [{actor}] workspace activated: {workspace}")
+            except (json.JSONDecodeError, Exception):
+                pass
+
+    def get_active_task_id(self, name: str) -> int | None:
+        return self._active_task_ids.get(name)
 
     def _default_request_kind(self) -> str:
         return "assignment"

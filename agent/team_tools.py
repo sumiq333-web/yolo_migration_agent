@@ -32,7 +32,10 @@ def build_engineer_profile(
     write_file_fn,
     edit_file_fn,
     scan_yolo_fn,
+    bash_fn,
+    run_python_fn,
     task_manager,
+    get_task_id_fn=None,
 ) -> ToolProfile:
     tools = [
         {
@@ -80,12 +83,13 @@ def build_engineer_profile(
         },
         {
             "name": "write_file",
-            "description": "Write content to a file.",
+            "description": "Write content to a file. Set create=True only when the task explicitly asks to create a new file. Otherwise the file must already exist.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
+                    "create": {"type": "boolean"},
                 },
                 "required": ["path", "content"],
             },
@@ -104,19 +108,44 @@ def build_engineer_profile(
             },
         },
         {
-            "name": "todo_update",
-            "description": "Update status of one todo item in your assigned task. This tool is granted by the leader at dispatch: if no task with todos was dispatched to you, this tool has no work to do.",
+            "name": "run_shell",
+            "description": "Run a shell command. On Windows this runs under cmd.exe. Use Windows-compatible syntax: dir, type, echo, python. Avoid cat/grep/heredoc.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "integer"},
-                    "todo_index": {"type": "integer"},
+                    "command": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "run_python",
+            "description": "Run a Python code snippet directly (no shell). Use for YAML validation, file parsing, or quick checks.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                },
+                "required": ["code"],
+            },
+        },
+        {
+            "name": "todo_update",
+            "description": "Update status of one todo item in your assigned task. Use failed/blocked with a reason when you cannot complete a step. This tool is granted by the leader at dispatch.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "in_progress", "completed"],
+                        "enum": ["pending", "in_progress", "completed", "failed", "blocked", "skipped"],
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required when status is failed or blocked.",
                     },
                 },
-                "required": ["task_id", "todo_index", "status"],
+                "required": ["index", "status"],
             },
         },
         {
@@ -145,13 +174,16 @@ def build_engineer_profile(
         },
     ]
 
-    def _handle_todo_update(sender, task_manager, task_id, todo_index, status):
+    def _handle_todo_update(sender, task_manager, get_task_id_fn, index, status, reason=""):
+        task_id = get_task_id_fn(sender) if get_task_id_fn else None
+        if task_id is None:
+            return "Error: no active task assigned to you. Wait for a dispatch."
         task = task_manager.get(int(task_id))
         if task["owner"] != sender:
             return f"Error: task #{task_id} is not assigned to {sender}"
         try:
             return json.dumps(
-                task_manager.update_todo_item(int(task_id), int(todo_index), status),
+                task_manager.update_todo_item(int(task_id), int(index), status, reason or ""),
                 ensure_ascii=False, indent=2,
             )
         except ValueError as e:
@@ -173,13 +205,19 @@ def build_engineer_profile(
             )
         ),
         "write_file": lambda sender, **kw: str(
-            write_file_fn(kw["path"], kw["content"])
+            write_file_fn(kw["path"], kw["content"], kw.get("create", False))
         ),
         "edit_file": lambda sender, **kw: str(
             edit_file_fn(kw["path"], kw["old_text"], kw["new_text"])
         ),
+        "run_shell": lambda sender, **kw: str(
+            bash_fn(kw["command"])
+        ),
+        "run_python": lambda sender, **kw: str(
+            run_python_fn(kw["code"])
+        ),
         "todo_update": lambda sender, **kw: _handle_todo_update(
-            sender, task_manager, kw["task_id"], kw["todo_index"], kw["status"]
+            sender, task_manager, get_task_id_fn, kw["index"], kw["status"], kw.get("reason", "")
         ),
         "send_message": lambda sender, **kw: bus.send(
             sender=sender,
@@ -209,7 +247,10 @@ def build_reviewer_profile(
     write_file_fn,
     edit_file_fn,
     scan_yolo_fn,
+    bash_fn,
+    run_python_fn,
     task_manager,
+    get_task_id_fn=None,
 ) -> ToolProfile:
     base = build_engineer_profile(
         bus=bus,
@@ -218,10 +259,13 @@ def build_reviewer_profile(
         write_file_fn=write_file_fn,
         edit_file_fn=edit_file_fn,
         scan_yolo_fn=scan_yolo_fn,
+        bash_fn=bash_fn,
+        run_python_fn=run_python_fn,
         task_manager=task_manager,
+        get_task_id_fn=get_task_id_fn,
     )
 
-    MUTATING_TOOLS = {"write_file", "edit_file"}
+    MUTATING_TOOLS = {"write_file", "edit_file", "run_shell"}
     tools = []
 
     for tool in base.tools:
@@ -274,6 +318,7 @@ def build_experiment_runner_profile(
     write_file_fn=None,
     edit_file_fn=None,
     task_manager=None,
+    get_task_id_fn=None,
 ) -> ToolProfile:
     tools = [
         {
@@ -302,12 +347,13 @@ def build_experiment_runner_profile(
         },
         {
             "name": "write_file",
-            "description": "Write content to a file.",
+            "description": "Write content to a file. Set create=True only when the task explicitly asks to create a new file. Otherwise the file must already exist.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
+                    "create": {"type": "boolean"},
                 },
                 "required": ["path", "content"],
             },
@@ -327,29 +373,35 @@ def build_experiment_runner_profile(
         },
         {
             "name": "todo_update",
-            "description": "Update status of one todo item in your assigned task. This tool is granted by the leader at dispatch: if no task with todos was dispatched to you, this tool has no work to do.",
+            "description": "Update status of one todo item in your assigned task. Use failed/blocked with a reason when you cannot complete a step. This tool is granted by the leader at dispatch.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "integer"},
-                    "todo_index": {"type": "integer"},
+                    "index": {"type": "integer"},
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "in_progress", "completed"],
+                        "enum": ["pending", "in_progress", "completed", "failed", "blocked", "skipped"],
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Required when status is failed or blocked.",
                     },
                 },
-                "required": ["task_id", "todo_index", "status"],
+                "required": ["index", "status"],
             },
         },
     ]
 
-    def _handle_todo_update(sender, task_manager, task_id, todo_index, status):
+    def _handle_todo_update(sender, task_manager, get_task_id_fn, index, status, reason=""):
+        task_id = get_task_id_fn(sender) if get_task_id_fn else None
+        if task_id is None:
+            return "Error: no active task assigned to you. Wait for a dispatch."
         task = task_manager.get(int(task_id))
         if task["owner"] != sender:
             return f"Error: task #{task_id} is not assigned to {sender}"
         try:
             return json.dumps(
-                task_manager.update_todo_item(int(task_id), int(todo_index), status),
+                task_manager.update_todo_item(int(task_id), int(index), status, reason or ""),
                 ensure_ascii=False, indent=2,
             )
         except ValueError as e:
@@ -368,13 +420,13 @@ def build_experiment_runner_profile(
             indent=2,
         ),
         "write_file": lambda sender, **kw: str(
-            write_file_fn(kw["path"], kw["content"])
+            write_file_fn(kw["path"], kw["content"], kw.get("create", False))
         ) if write_file_fn else "Error: write_file not available",
         "edit_file": lambda sender, **kw: str(
             edit_file_fn(kw["path"], kw["old_text"], kw["new_text"])
         ) if edit_file_fn else "Error: edit_file not available",
         "todo_update": lambda sender, **kw: _handle_todo_update(
-            sender, task_manager, kw["task_id"], kw["todo_index"], kw["status"]
+            sender, task_manager, get_task_id_fn, kw["index"], kw["status"], kw.get("reason", "")
         ) if task_manager else "Error: todo_update not available",
     }
 

@@ -177,6 +177,10 @@ class SystemPromptBuilder:
     - If the user only asks to create, list, inspect, or plan tasks, report task state and do not begin execution.
     - If the user explicitly asks to start or continue a ready task, claim it with in_progress and proceed.
 
+    Workspace rules:
+    - Before creating a task that involves file access, use task_set_workspace to set the YOLO repository root.
+    - A task without workspace cannot be dispatched. task_set_workspace persists the path and activates it for the current process.
+
     Teammate dispatch rules:
     - After dispatching a task to a teammate via dispatch_to_teammate, the task enters in_progress with the teammate as owner.
     - The teammate will work autonomously and send results to your inbox.
