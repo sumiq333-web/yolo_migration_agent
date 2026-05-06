@@ -1,12 +1,26 @@
 {
   "id": 1,
-  "subject": "分析 yolo11.yaml",
-  "description": "",
+  "subject": "给 yolo11.yaml 加一行注释",
+  "description": "在 yolo11.yaml 文件头部添加一行注释 '# test migration'，并验证 yaml 能正常 parse",
   "status": "completed",
   "blockedBy": [],
-  "blocks": [
-    2,
-    4
-  ],
-  "owner": ""
+  "blocks": [],
+  "owner": "engineer",
+  "todos": [
+    {
+      "activeForm": "找到 yolo11.yaml 文件位置",
+      "content": "找到 yolo11.yaml 文件位置",
+      "status": "completed"
+    },
+    {
+      "activeForm": "在文件头部加一行注释",
+      "content": "在文件头部加一行注释 '# test migration'",
+      "status": "completed"
+    },
+    {
+      "activeForm": "验证 yaml 能正常 parse",
+      "content": "用 bash 跑 python 验证 yaml 能正常 parse",
+      "status": "completed"
+    }
+  ]
 }

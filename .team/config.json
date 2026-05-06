@@ -8,9 +8,9 @@
       "instructions": "Specialize in reading target repositories, external repositories, papers, model code, architecture files, and migration points. Produce practical migration plans and implementation guidance.",
       "status": "idle",
       "created_at": 1777380968.6368902,
-      "updated_at": 1777531386.3061643,
+      "updated_at": 1778047133.5377645,
       "previous_status": "working",
-      "recovered_at": 1777450349.2546735
+      "recovered_at": 1778040564.9988399
     },
     {
       "name": "reviewer",

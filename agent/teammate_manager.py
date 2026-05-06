@@ -465,7 +465,8 @@ class TeammateManager:
                 runner_result = runner.run(messages)
                 messages = runner_result.messages
 
-                break
+                if runner_result.stop_reason == "stopped_after_tool":
+                    break
 
         except Exception as e:
             self.bus.send(
@@ -568,7 +569,9 @@ class TeammateManager:
 
     Protocol rules:
     - Messages with request_id are tracked protocol messages.
-    - If you complete a tracked assignment, send the final answer to lead with msg_type=task_result.
+    - The dispatch message may contain a <task-context> block with a "todos" list. This is your work plan. Work through each todo item in order.
+    - Use todo_update to mark each todo item: set in_progress before starting, then completed when finished.
+    - If you complete ALL todos for the task, send the final answer to lead with msg_type=task_result. Sending task_result ends this work session.
     - If you cannot complete a tracked assignment, send msg_type=error and include the failure reason.
     - Do not use msg_type=message for a tracked request final response.
     - Use msg_type=message only for ordinary non-tracked communication.

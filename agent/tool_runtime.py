@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -81,10 +82,22 @@ def execute_tool_block(
     stop = hooks.first_stopping_result(results_before)
 
     if stop is not None:
-        output, meta, status, reason = _build_denied_output(
-            tool_name=tool_name,
-            stop=stop,
-        )
+        decision = getattr(stop, "decision", None)
+        if decision == "ask" and (tool_actor or _prompt_user_approval(tool_name, tool_input, stop)):
+            output, meta, status, reason = _execute_allowed_tool(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                messages=messages,
+                tool_handlers=tool_handlers,
+                hooks=hooks,
+                prompt_dirty_fn=prompt_dirty_fn,
+                tool_actor=tool_actor,
+            )
+        else:
+            output, meta, status, reason = _build_denied_output(
+                tool_name=tool_name,
+                stop=stop,
+            )
     else:
         output, meta, status, reason = _execute_allowed_tool(
             tool_name=tool_name,
@@ -119,6 +132,24 @@ def execute_tool_block(
         reason=reason,
         tool_name=tool_name,
     )
+
+
+def _prompt_user_approval(tool_name: str, tool_input: dict, stop: Any) -> bool:
+    """Prompt the user to approve a tool call that requires confirmation."""
+    summary = json.dumps(tool_input, ensure_ascii=False)
+    if len(summary) > 500:
+        summary = summary[:500] + "..."
+    prompt = (
+        f"\n\033[33m[ASK] {tool_name}\033[0m\n"
+        f"  input: {summary}\n"
+        f"  reason: {getattr(stop, 'reason', '')}\n"
+        f"  \033[36mApprove? [y]es / [n]o:\033[0m "
+    )
+    try:
+        answer = input(prompt).strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
 
 
 def _build_denied_output(

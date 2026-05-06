@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = Path(inbox_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._lead_event = threading.Event()
 
     def send(
         self,
@@ -79,6 +81,9 @@ class MessageBus:
 
         with inbox_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+        if to == "lead":
+            self._lead_event.set()
 
         return f"Sent {msg_type} from {sender} to {to}."
 
@@ -122,6 +127,13 @@ class MessageBus:
                 )
 
         return messages
+
+    def wait_for_lead(self, timeout: float = 10) -> bool:
+        """Block until a message arrives for the lead, or timeout. Returns True if woken."""
+        triggered = self._lead_event.wait(timeout=timeout)
+        if triggered:
+            self._lead_event.clear()
+        return triggered
 
     def broadcast(
         self,

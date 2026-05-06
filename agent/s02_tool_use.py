@@ -121,17 +121,28 @@ TEAM_TOOL_PROFILES = {
         bus=TEAM_BUS,
         read_file_fn=run_read,
         read_code_fn=run_read_code,
+        write_file_fn=run_write,
+        edit_file_fn=run_edit,
+        scan_yolo_fn=scan_yolo_project,
+        task_manager=TASK_MANAGER,
     ),
     "reviewer": build_reviewer_profile(
         bus=TEAM_BUS,
         read_file_fn=run_read,
         read_code_fn=run_read_code,
+        write_file_fn=run_write,
+        edit_file_fn=run_edit,
+        scan_yolo_fn=scan_yolo_project,
+        task_manager=TASK_MANAGER,
     ),
     "experiment_runner": build_experiment_runner_profile(
         bus=TEAM_BUS,
         background_run_fn=BACKGROUND_MANAGER.run,
         background_check_fn=BACKGROUND_MANAGER.check,
         background_list_fn=lambda: BACKGROUND_MANAGER.check(),
+        write_file_fn=run_write,
+        edit_file_fn=run_edit,
+        task_manager=TASK_MANAGER,
     ),
 }
 
@@ -162,15 +173,55 @@ def maybe_mark_prompt_dirty(tool_name: str, tool_output: str) -> None:
 
     PROMPT_BUILDER.mark_stable_dirty()
 # -- The dispatch map: {tool_name: handler} --
+def _handle_dispatch(kw: dict) -> str:
+    """Dispatch a task to a teammate. If task_id is set, assign owner + in_progress first."""
+    task_id = kw.get("task_id")
+    to = kw["to"]
+    if task_id is not None:
+        try:
+            TASK_MANAGER.assign(int(task_id), to)
+            TASK_MANAGER.set_status(int(task_id), "in_progress")
+        except ValueError as e:
+            return f"Error: {e}"
+    return TEAM_MANAGER.dispatch(
+        to=to,
+        content=_build_dispatch_content(kw),
+        msg_type="task_request",
+    )
+
+
+def _build_dispatch_content(kw: dict) -> str:
+    """If task_id is present, embed task context in the dispatch message."""
+    content = kw["content"]
+    task_id = kw.get("task_id")
+    if task_id is None:
+        return content
+    try:
+        task = TASK_MANAGER.get(int(task_id))
+    except (ValueError, KeyError):
+        return content
+    header = {
+        "task_id": task["id"],
+        "subject": task["subject"],
+        "todos": task.get("todos", []),
+    }
+    return (
+        f"<task-context>\n"
+        f"{json.dumps(header, ensure_ascii=False, indent=2)}\n"
+        f"</task-context>\n\n"
+        f"{content}"
+    )
+
+
 def auto_compact_for_recovery(messages: list) -> list:
     compacted_messages, _changed = micro_compact_messages(messages)
     return compacted_messages
 
 TOOL_HANDLERS = {
-    # "bash":       lambda **kw: run_bash(kw["command"]),
+    "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    # "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    # "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "scan_paper": lambda **kw: paper_tools(),
     "scan_yolo_project": lambda **kw: scan_yolo_project(kw["path"]),
     "set_yolo_workspace": lambda **kw: set_yolo_workspace(kw["path"]),
@@ -201,6 +252,10 @@ TOOL_HANDLERS = {
     "task_set_status": lambda **kw: TASK_MANAGER.set_status(
         kw["id"],
         kw["status"],
+    ),
+    "task_set_todos": lambda **kw: json.dumps(
+        TASK_MANAGER.set_todos(kw["task_id"], kw["todos"]),
+        ensure_ascii=False, indent=2,
     ),
     "background_run": lambda **kw: BACKGROUND_MANAGER.run(
         kw["command"],
@@ -244,11 +299,7 @@ TOOL_HANDLERS = {
         content=kw["content"],
         msg_type=kw.get("msg_type", "broadcast"),
     ),
-    "dispatch_to_teammate": lambda **kw: TEAM_MANAGER.dispatch(
-    to=kw["to"],
-    content=kw["content"],
-    msg_type="task_request",
-    ),
+    "dispatch_to_teammate": lambda **kw: _handle_dispatch(kw),
     "request_list": lambda **kw: REQUEST_STORE.render_requests(
         include_terminal=kw.get("include_terminal", True),
         limit=kw.get("limit", 20),
@@ -265,14 +316,14 @@ STABLE_PROMPT_MUTATION_TOOLS = {
     # 以后如果你支持动态增删 skill、改 instruction 文件，也加进来
 }
 TOOLS = [
-    # {"name": "bash", "description": "Run a shell command.",
-    #  "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "bash", "description": "Run a shell command.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    # {"name": "write_file", "description": "Write content to file.",
-    #  "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    # {"name": "edit_file", "description": "Replace exact text in file.",
-    #  "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {"name": "write_file", "description": "Write content to file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in file.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 {
         "name":"scan_paper",
         "description":"Scan a paper to get the github address",
@@ -502,6 +553,36 @@ TOOLS = [
     },
 },
 {
+    "name": "task_set_todos",
+    "description": (
+        "Set the todo list for a task. "
+        "Use this before dispatching a task to a teammate. "
+        "Each todo item needs content, status (pending/in_progress/completed), and activeForm."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "integer"},
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                        "activeForm": {"type": "string"},
+                    },
+                    "required": ["content", "status", "activeForm"],
+                },
+            },
+        },
+        "required": ["task_id", "todos"],
+    },
+},
+{
     "name": "background_run",
     "description": (
         "Run a long command in a background runtime slot. "
@@ -674,7 +755,8 @@ TOOLS = [
     "description": (
         "Create one tracked assignment request, send it from lead to a fixed teammate, "
         "attach a request_id, and wake that teammate if needed. "
-        "Use this for normal teammate task dispatch."
+        "Use this for normal teammate task dispatch. "
+        "Include task_id to send the task and its todos to the teammate."
     ),
     "input_schema": {
         "type": "object",
@@ -684,6 +766,10 @@ TOOLS = [
                 "enum": ["engineer", "reviewer", "experiment_runner"],
             },
             "content": {"type": "string"},
+            "task_id": {
+                "type": "integer",
+                "description": "Task ID to dispatch. The task's todos will be sent with it.",
+            },
         },
         "required": ["to", "content"],
     },
@@ -852,6 +938,17 @@ def sync_requests_from_lead_inbox(inbox: list[dict]) -> None:
         except ValueError as e:
             print(f"[RequestStore] {e}")
 
+def _has_active_tasks() -> bool:
+    for f in TASKS_DIR.glob("task_*.json"):
+        try:
+            t = json.loads(f.read_text(encoding="utf-8"))
+            if t.get("status") in ("pending", "in_progress"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def agent_loop(messages: list):
     recovery_state = new_recovery_state()
     while True:
@@ -915,7 +1012,10 @@ def agent_loop(messages: list):
 
         runner_result = runner.run(messages)
         messages[:] = runner_result.messages
-        return
+
+        if not _has_active_tasks():
+            return
+        TEAM_BUS.wait_for_lead(timeout=10)
 
 
 def extract_text_blocks(content) -> list[str]:

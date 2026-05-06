@@ -34,6 +34,8 @@ READ_ONLY_TOOLS = {
 LOW_RISK_STATE_TOOLS = {
     "task_create_graph",
     "task_set_status",
+    "task_set_todos",
+    "todo_update",
     "cron_create",
     "cron_delete",
     "schedule_after",
@@ -50,12 +52,11 @@ LOW_RISK_STATE_TOOLS = {
 MUTATING_TOOLS = {
     "write_file",
     "edit_file",
+    "bash",
     "task",
 }
 
-DENIED_TOOLS = {
-    "bash",
-}
+DENIED_TOOLS: set[str] = set()
 
 LOW_RISK_BACKGROUND_PREFIXES = (
     "python -c",

@@ -135,6 +135,7 @@ class SystemPromptBuilder:
     - Do NOT directly answer the question without using tools.
     - If you have not used a tool yet, your next message MUST be a tool call.
     - Only update todo when progress changes significantly.
+    - Before dispatching a task that requires code modification (write_file, edit_file, bash), ask the user to confirm. Summarize what will be changed and which files are affected, then wait for the user's approval before calling dispatch_to_teammate.
     """.strip()
 
     def _build_tool_listing(self) -> str:
@@ -175,6 +176,14 @@ class SystemPromptBuilder:
     Intent boundary:
     - If the user only asks to create, list, inspect, or plan tasks, report task state and do not begin execution.
     - If the user explicitly asks to start or continue a ready task, claim it with in_progress and proceed.
+
+    Teammate dispatch rules:
+    - After dispatching a task to a teammate via dispatch_to_teammate, the task enters in_progress with the teammate as owner.
+    - The teammate will work autonomously and send results to your inbox.
+    - Do NOT tell the user the task is finished after dispatching. Instead, wait.
+    - Use read_inbox to check for teammate responses (task_result, error, review_result, experiment_result).
+    - When a task_result arrives, review it and report to the user. If the result is satisfactory, call task_set_status with status="completed".
+    - If an error arrives, report the failure to the user and call task_set_status with status="pending" for retry.
     """.strip()
 
     def _build_skill_listing(self) -> str:

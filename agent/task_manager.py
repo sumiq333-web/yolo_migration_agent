@@ -18,6 +18,7 @@ class TaskRecord:
     blockedBy: list[int] = field(default_factory=list)
     blocks: list[int] = field(default_factory=list)
     owner: str = ""
+    todos: list[dict] = field(default_factory=list)
 
     def is_ready(self) -> bool:
         return self.status == "pending" and not self.blockedBy
@@ -132,6 +133,13 @@ class TaskManager:
             raise ValueError(f"Invalid task status: {status}")
 
         task = self._load(task_id)
+
+        if status == "completed" and task.todos:
+            undone = [t for t in task.todos if t["status"] != "completed"]
+            if undone:
+                items = ", ".join(f"#{i}: {t['content']}" for i, t in enumerate(undone))
+                raise ValueError(f"Cannot complete: {len(undone)} todo(s) not done: {items}")
+
         task.status = status  # type: ignore[assignment]
         self._save(task)
 
@@ -139,6 +147,29 @@ class TaskManager:
             self._unlock_tasks_blocked_by(task_id)
 
         return self._to_public(self._load(task_id))
+
+    def set_todos(self, task_id: int, todos: list[dict]) -> dict:
+        task = self._load(task_id)
+        for i, item in enumerate(todos):
+            content = str(item.get("content", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            if not content:
+                raise ValueError(f"Todo {i}: content required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Todo {i}: invalid status '{status}'")
+        task.todos = todos
+        self._save(task)
+        return self._to_public(task)
+
+    def update_todo_item(self, task_id: int, index: int, status: str) -> dict:
+        task = self._load(task_id)
+        if index < 0 or index >= len(task.todos):
+            raise ValueError(f"Todo index {index} out of range")
+        if status not in ("pending", "in_progress", "completed"):
+            raise ValueError(f"Invalid todo status: {status}")
+        task.todos[index]["status"] = status
+        self._save(task)
+        return self._to_public(task)
 
     def assign(self, task_id: int, owner: str) -> dict:
         task = self._load(task_id)
