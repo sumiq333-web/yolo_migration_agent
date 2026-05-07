@@ -57,13 +57,25 @@ class AgentRunnerConfig:
 @dataclass
 class AgentRunnerResult:
     """
-    Result of one AgentRunner.run call.
-    """
+    单次 AgentRunner.run 的返回结果。
 
+    注意：
+    AgentRunner 是 lead / teammate 共用运行器。
+    它不能判断 task 是否 terminal，也不能决定是否补最终用户报告。
+    它只暴露 text_response / has_text_response 给外层 loop 使用。
+    """
     messages: list[dict]
     stop_reason: str
     response: Any | None = None
     tool_executions: list[ToolExecutionResult] = field(default_factory=list)
+
+    # 本轮模型产生的自然语言文本。工具调用轮通常为空。
+    text_response: str = ""
+
+    @property
+    def has_text_response(self) -> bool:
+        """本轮是否产生了可展示/可转发的自然语言文本。"""
+        return bool(self.text_response.strip())
 
 
 class AgentRunner:
@@ -139,6 +151,7 @@ class AgentRunner:
 
             if response.stop_reason != "tool_use":
                 text = self._extract_text(response.content).strip()
+
                 if text and self.config.on_text_response_fn is not None:
                     self.config.on_text_response_fn(text)
 
@@ -147,6 +160,7 @@ class AgentRunner:
                     stop_reason=response.stop_reason or "text_response",
                     response=response,
                     tool_executions=all_tool_executions,
+                    text_response=text,
                 )
 
             tool_results = []

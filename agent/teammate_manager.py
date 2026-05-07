@@ -532,9 +532,18 @@ class TeammateManager:
                 runner_result = runner.run(messages)
                 messages = runner_result.messages
 
+                # 先执行 forced failure finalization。
+                # 如果 edit_file/write_file 失败，这里会强制：
+                # 1. todo_update(status="failed", reason=...)
+                # 2. send_message(msg_type="error")
                 self._drain_forced_tool_actions(name, member)
 
                 if runner_result.stop_reason in ("stopped_after_tool",):
+                    break
+
+                # teammate 如果直接自然语言回复，AgentRunner 已经通过 on_text_response_fn
+                # 把文本转发给 lead。这里应该停止，不能继续空转。
+                if runner_result.has_text_response:
                     break
 
                 if "exhausted" in runner_result.stop_reason or runner_result.stop_reason in ("empty_response",):

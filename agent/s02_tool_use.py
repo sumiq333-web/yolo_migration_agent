@@ -187,6 +187,35 @@ def _is_task_already_assigned_to(task: dict, teammate: str) -> bool:
                 and task.get("status") in ("in_progress", "blocked", "failed")
     )
 # -- The dispatch map: {tool_name: handler} --
+def _handle_final_report(kw: dict) -> str:
+    """
+    标记最终汇报已完成。
+
+    约束：
+    1. summary 必须非空。
+    2. 只有所有 task 都进入 terminal 状态后才能调用。
+    3. 幂等：重复调用不覆盖第一次报告。
+    """
+    summary = str(kw.get("summary", "")).strip()
+
+    if not summary:
+        return "Error: task_final_report requires a non-empty summary."
+
+    if _has_active_tasks():
+        return (
+            "Error: task_final_report cannot be called while active tasks still exist. "
+            "Resolve pending, in_progress, or blocked tasks first."
+        )
+
+    if FINAL_REPORT_STATE["reported"]:
+        return "Final report already recorded."
+
+    FINAL_REPORT_STATE["reported"] = True
+    FINAL_REPORT_STATE["summary"] = summary
+
+    return f"Final report recorded: {summary[:200]}"
+
+
 def _handle_dispatch(kw: dict) -> str:
     """Dispatch a task to a teammate. If task_id is set, assign owner + in_progress first."""
     task_id = kw.get("task_id")
@@ -318,6 +347,7 @@ TOOL_HANDLERS = {
     ),
     "task_get": lambda **kw: TASK_MANAGER.get(kw["id"]),
     "task_ready": lambda **kw: TASK_MANAGER.render_ready(),
+    "task_final_report": lambda **kw: _handle_final_report(kw),
     "task_set_status": lambda **kw: TASK_MANAGER.set_status(
     kw["id"],
     kw["status"],
@@ -608,6 +638,17 @@ TOOLS = [
         "type": "object",
         "properties": {},
         "required": [],
+    },
+},
+{
+    "name": "task_final_report",
+    "description": "Call this to deliver the final natural-language summary to the user and exit the agent loop. Required when all tasks have reached a terminal state (completed / failed / deleted).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Short natural-language summary of what happened across all tasks."},
+        },
+        "required": ["summary"],
     },
 },
 {
@@ -1048,6 +1089,72 @@ def sync_requests_from_lead_inbox(inbox: list[dict]) -> None:
         except ValueError as e:
             print(f"[RequestStore] {e}")
 
+# -- terminal report --------------------------------------------------
+# agent_loop 退出前必须用自然语言向用户汇报。此状态由 task_final_report 工具写入。
+
+FINAL_REPORT_STATE = {"reported": False, "summary": ""}
+
+
+def _build_terminal_report_reminder() -> str:
+    """当所有 task 已 terminal 但模型还没做最终汇报时，注入提醒。"""
+    lines = []
+    for f in sorted(TASKS_DIR.glob("task_*.json")):
+        try:
+            t = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        lines.append(f"  #{t['id']} [{t.get('status', '?')}] {t.get('subject', '')}")
+    block = "\n".join(lines) if lines else "(no tasks)"
+    return (
+        "<system-reminder>\n"
+        "All tasks have reached a terminal state (completed / failed / deleted).\n"
+        "You MUST give the user a short natural-language summary of what happened.\n"
+        "Then call task_final_report with the summary string.\n\n"
+        f"Current task state:\n{block}\n"
+        "</system-reminder>"
+    )
+
+
+def _last_assistant_has_text(messages: list) -> bool:
+    """最近一条 assistant 消息是否包含自然语言文本。"""
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", [])
+        if isinstance(content, str):
+            return bool(content.strip())
+        for b in content if isinstance(content, list) else []:
+            text = b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+            if text.strip():
+                return True
+    return False
+
+
+def _append_fallback_terminal_report(messages: list) -> None:
+    """
+    兜底：二次提醒后模型仍未产出文本时，用 FINAL_REPORT_STATE 或任务摘要
+    作为 assistant 消息插入，避免静默退出。
+    """
+    summary = FINAL_REPORT_STATE.get("summary", "").strip()
+    if not summary:
+        tasks: list[dict] = []
+        for f in TASKS_DIR.glob("task_*.json"):
+            try:
+                tasks.append(json.loads(f.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        done = [t for t in tasks if t.get("status") == "completed"]
+        failed = [t for t in tasks if t.get("status") == "failed"]
+        parts = []
+        if done:
+            parts.append(f"{len(done)} task(s) completed")
+        if failed:
+            parts.append(f"{len(failed)} task(s) failed")
+        summary = "Work finished. " + (", ".join(parts) if parts else "No task changes.")
+    if not _last_assistant_has_text(messages):
+        messages.append({"role": "assistant", "content": summary})
+
+
 def _has_active_tasks() -> bool:
     """
     当前执行图只允许在 task 进入 terminal 状态后结束。
@@ -1073,7 +1180,10 @@ def _has_active_tasks() -> bool:
 
 
 def agent_loop(messages: list):
-    recovery_state = new_recovery_state()
+    # 每次用户输入都会重新进入 agent_loop，重置汇报状态。
+    FINAL_REPORT_STATE["reported"] = False
+    FINAL_REPORT_STATE["summary"] = ""
+    terminal_report_attempted = False
     while True:
         notification_text = BACKGROUND_MANAGER.render_notifications()
         if notification_text:
@@ -1135,9 +1245,30 @@ def agent_loop(messages: list):
 
         runner_result = runner.run(messages)
         messages[:] = runner_result.messages
-
         if not _has_active_tasks():
+            # 所有 task 已 terminal 后，只有 task_final_report 才是退出凭证。
+            if FINAL_REPORT_STATE["reported"]:
+                # 如果 task_final_report 是作为工具调用完成的，最后一条 assistant 可能没有自然语言文本。
+                # 这里把 summary 补成 assistant 文本，保证 CLI 能打印出来。
+                if not _last_assistant_has_text(messages):
+                    messages.append({
+                        "role": "assistant",
+                        "content": FINAL_REPORT_STATE["summary"],
+                    })
+                return
+
+            if not terminal_report_attempted:
+                terminal_report_attempted = True
+                messages.append({
+                    "role": "user",
+                    "content": _build_terminal_report_reminder(),
+                })
+                continue
+
+            _append_fallback_terminal_report(messages)
             return
+
+        # 仍有非 terminal 任务，等待 teammate 消息再继续。
         TEAM_BUS.wait_for_lead(timeout=10)
 
 

@@ -204,13 +204,12 @@ class SystemPromptBuilder:
 
     Teammate error handling:
     - When a teammate error arrives, inspect the task, failed todo, failed tool, and error reason.
-    - First decide whether the failure is repairable.
-    - Repairable errors include wrong path, stale workspace, missing validation command, temporary environment issue, or a failed todo that can be retried without changing user intent.
-    - Non-repairable errors include missing required target, unsupported capability, permission denial, user constraint conflict, or a tool_error that proves the requested operation cannot be completed safely.
-    - If the failure is repairable and the existing todo plan is still valid, retry with dispatch_to_teammate(allow_retry=true) and a clear retry instruction.
-    - If repair requires changing the plan, create a new task or ask the user. Do not rewrite todos of an already dispatched task.
-    - If the failure is not repairable, call task_set_status(status="failed", reason=...).
-    - If the failed task is critical for downstream tasks, call task_set_status(status="failed", reason=..., cascade_failed=true) so dependent tasks fail too.
+    - Decide whether the failure is repairable. Repairable errors include wrong path, stale workspace, or a todo that can be retried without changing user intent.
+    - Non-repairable errors include missing target file, unsupported capability, permission denial, or a tool_error proving the operation cannot be done safely.
+    - If repairable: retry with dispatch_to_teammate(allow_retry=true) and a clear fix instruction.
+    - If not repairable: call task_set_status(status="failed", reason=...). Do NOT redispatch.
+    - Do not rewrite todos of an already dispatched task to bypass failed evidence.
+    - If the failed task blocks downstream tasks, call task_set_status(status="failed", reason=..., cascade_failed=true).
     - After setting a task to failed, report the final failed status and reason to the user.
 
     Final reporting rules:

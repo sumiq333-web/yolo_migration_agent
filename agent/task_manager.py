@@ -188,7 +188,19 @@ class TaskManager:
                 f"Cannot mark task #{task_id} as failed without a reason."
             )
 
-        # completed 是成功终态，不能有 pending/in_progress/failed/blocked todo。
+        # failed 是失败终态；进入 failed 后，未执行完的 pending/in_progress todo 自动收束为 skipped。
+        if status == "failed" and task.todos:
+            for i, todo in enumerate(task.todos):
+                # 兼容历史数据或手动编辑造成的大小写/空格问题
+                todo_status = str(todo.get("status", "")).strip().lower()
+
+                if todo_status in ("pending", "in_progress"):
+                    task.todos[i]["status"] = "skipped"
+                    task.todos[i]["reason"] = (
+                            f"Skipped because parent task #{task_id} was set to failed"
+                            + (f": {reason}" if reason else ".")
+                    )
+
         if status == "completed" and task.todos:
             undone = [
                 t for t in task.todos

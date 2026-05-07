@@ -34,6 +34,7 @@ READ_ONLY_TOOLS = {
 
 LOW_RISK_STATE_TOOLS = {
     "task_create_graph",
+    "task_final_report",
     "task_set_status",
     "task_set_workspace",
     "task_set_todos",
