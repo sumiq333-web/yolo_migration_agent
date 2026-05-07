@@ -7,9 +7,6 @@ from pathlib import Path
 
 from agent.message_bus import MessageBus
 from agent.team_tools import ToolProfile
-from agent.tool_runtime import execute_tool_block
-from agent.model_runtime import call_model_with_recovery
-from agent.tool_runtime import execute_tool_block
 from agent.agent_runner import AgentRunner, AgentRunnerConfig
 
 
@@ -75,14 +72,36 @@ class TeammateManager:
         self.threads: dict[str, threading.Thread] = {}
         self.active_request_ids: dict[str, str] = {}
         self._active_task_ids: dict[str, int] = {}
+        self._active_todo_indexes: dict[str, int] = {}
+        self._forced_tool_actions: dict[str, list[dict]] = {}
 
     # ------------------------------------------------------------------
     # Team registry
     # ------------------------------------------------------------------
+    def _send_teammate_error(self, actor: str, content: str) -> None:
+        self.bus.send(
+            sender=actor,
+            to="lead",
+            content=content,
+            msg_type="error",
+            extra=self._request_extra_for(actor),
+        )
+
     def _report_tool_errors(self, name: str, executions) -> None:
+        """
+        把工具错误报告给 lead。
+
+        注意：
+        - write_file/edit_file 这类 mutating file failure 会由 forced failure finalization
+          统一执行 todo_update(failed) + send_message(error)。
+        - 这里跳过它们，避免 lead 收到两条重复 error。
+        """
         payload = []
 
         for execution in executions:
+            if self._is_mutating_file_failure(execution):
+                continue
+
             payload.append(
                 {
                     "tool": execution.tool_name,
@@ -90,6 +109,9 @@ class TeammateManager:
                     "reason": execution.reason,
                 }
             )
+
+        if not payload:
+            return
 
         self.bus.send(
             sender=name,
@@ -108,10 +130,50 @@ class TeammateManager:
             extra=self._request_extra_for(name),
         )
 
-    def _should_stop_after_teammate_tools(self, executions) -> bool:
+    STATE_SYNC_TOOLS = {"todo_update"}
+    MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
+
+    def _is_state_sync_failure(self, execution) -> bool:
+        return (
+                execution.tool_name in self.STATE_SYNC_TOOLS
+                and execution.status != "executed"
+        )
+
+    def _is_mutating_file_failure(self, execution) -> bool:
+        return (
+                execution.tool_name in self.MUTATING_FILE_TOOLS
+                and execution.status != "executed"
+        )
+
+
+
+    def _should_stop_after_teammate_tools(self, actor: str, executions) -> bool:
         for execution in executions:
             if execution.tool_name == "send_message" and execution.status == "executed":
                 return True
+
+            if self._is_state_sync_failure(execution):
+                self._send_teammate_error(
+                    actor,
+                    (
+                        "Teammate stopped after state-sync tool failure. "
+                        f"tool={execution.tool_name}, status={execution.status}, reason={execution.reason}"
+                    ),
+                )
+                print(
+                    "Stopping after state-sync failure: "
+                    f"{execution.tool_name} status={execution.status} reason={execution.reason}"
+                )
+                return True
+
+            if self._is_mutating_file_failure(execution):
+                self._schedule_forced_failure_finalization(actor, execution)
+                print(
+                    "Scheduling forced failure finalization after mutating file tool failure: "
+                    f"{execution.tool_name} status={execution.status} reason={execution.reason}"
+                )
+                return True
+
         return False
 
     def reload_config(self) -> str:
@@ -455,7 +517,9 @@ class TeammateManager:
                         prompt_dirty_fn=None,
                         log_fn=print,
 
-                        stop_after_tool_fn=self._should_stop_after_teammate_tools,
+                        stop_after_tool_fn=lambda executions, name=name: (
+                            self._should_stop_after_teammate_tools(name, executions)
+                        ),
                         on_text_response_fn=lambda text, name=name, member=member: (
                             self._send_text_response_to_lead(name, member, text)
                         ),
@@ -467,6 +531,8 @@ class TeammateManager:
 
                 runner_result = runner.run(messages)
                 messages = runner_result.messages
+
+                self._drain_forced_tool_actions(name, member)
 
                 if runner_result.stop_reason in ("stopped_after_tool",):
                     break
@@ -492,6 +558,9 @@ class TeammateManager:
         finally:
 
             self.active_request_ids.pop(name, None)
+            self._active_task_ids.pop(name, None)
+            self._active_todo_indexes.pop(name, None)
+            self._forced_tool_actions.pop(name, None)
 
             member = self._find_member(name)
 
@@ -511,6 +580,29 @@ class TeammateManager:
 
         return profile.tools
 
+    def _wrap_handler_for_runtime_tracking(self, member: dict, tool_name: str, handler):
+        def wrapped(sender: str, **kw) -> str:
+            output = handler(sender, **kw)
+
+            if tool_name == "todo_update":
+                try:
+                    index = int(kw["index"])
+                    status = str(kw.get("status", "")).strip().lower()
+
+                    if status == "in_progress":
+                        self._active_todo_indexes[sender] = index
+
+                    elif status in {"completed", "failed", "blocked", "skipped"}:
+                        if self._active_todo_indexes.get(sender) == index:
+                            self._active_todo_indexes.pop(sender, None)
+
+                except Exception:
+                    pass
+
+            return output
+
+        return wrapped
+
     def _handlers_for_member(self, member: dict) -> dict:
         profile_name = member.get("tool_profile", "")
         profile = self.tool_profiles.get(profile_name)
@@ -523,7 +615,10 @@ class TeammateManager:
         if "send_message" in handlers:
             handlers["send_message"] = self._build_send_message_handler(member)
 
-        return handlers
+        return {
+            tool_name: self._wrap_handler_for_runtime_tracking(member, tool_name, handler)
+            for tool_name, handler in handlers.items()
+        }
 
     def _build_send_message_handler(self, member: dict):
         def send_message(sender: str, **kw) -> str:
@@ -548,6 +643,47 @@ class TeammateManager:
 
         return send_message
 
+
+
+    def _drain_forced_tool_actions(self, actor: str, member: dict) -> None:
+        actions = self._forced_tool_actions.pop(actor, [])
+
+        if not actions:
+            return
+
+        handlers = self._handlers_for_member(member)
+
+        for action in actions:
+            tool_name = action["tool_name"]
+            args = action.get("args", {})
+
+            handler = handlers.get(tool_name)
+            if handler is None:
+                self._send_teammate_error(
+                    actor,
+                    f"Forced tool action failed: tool '{tool_name}' is not available.",
+                )
+                continue
+
+            try:
+                output = str(handler(actor, **args))
+                print(f"[{actor}] forced {tool_name}: {output[:500]}")
+
+                if output.lstrip().startswith("Error:"):
+                    self._send_teammate_error(
+                        actor,
+                        (
+                            "Forced tool action returned an error. "
+                            f"tool={tool_name}, output={output}"
+                        ),
+                    )
+
+            except Exception as e:
+                self._send_teammate_error(
+                    actor,
+                    f"Forced tool action failed: tool={tool_name}, error={e}",
+                )
+
     def _exec_tool_for_member(self, member: dict, tool_name: str, args: dict) -> str:
         profile_name = member.get("tool_profile", "")
         profile = self.tool_profiles.get(profile_name)
@@ -564,6 +700,50 @@ class TeammateManager:
             return str(handler(member["name"], **args))
         except Exception as e:
             return f"Error: {e}"
+
+    def _schedule_forced_failure_finalization(self, actor: str, execution) -> None:
+        todo_index = self._active_todo_indexes.get(actor)
+
+        if todo_index is None:
+            self._forced_tool_actions.setdefault(actor, []).append(
+                {
+                    "tool_name": "send_message",
+                    "args": {
+                        "content": (
+                            "Mutating file tool failed, but no active in_progress todo index "
+                            "was recorded for forced failure finalization. "
+                            f"tool={execution.tool_name}, status={execution.status}, reason={execution.reason}"
+                        ),
+                        "msg_type": "error",
+                    },
+                }
+            )
+            return
+
+        reason = (
+            f"Mutating file tool failed during teammate execution. "
+            f"tool={execution.tool_name}; status={execution.status}; reason={execution.reason}"
+        )
+
+        self._forced_tool_actions.setdefault(actor, []).extend(
+            [
+                {
+                    "tool_name": "todo_update",
+                    "args": {
+                        "index": todo_index,
+                        "status": "failed",
+                        "reason": reason,
+                    },
+                },
+                {
+                    "tool_name": "send_message",
+                    "args": {
+                        "content": reason,
+                        "msg_type": "error",
+                    },
+                },
+            ]
+        )
 
     # ------------------------------------------------------------------
     # Prompting
@@ -698,12 +878,24 @@ class TeammateManager:
         return "assignment"
 
     def _request_extra_for(self, name: str) -> dict:
+        """
+        给 teammate -> lead 的消息附加协议上下文。
+
+        request_id 用于 RequestStore 同步；
+        task_id 用于 lead 判断哪个 task 需要 retry / failed。
+        """
         request_id = self.active_request_ids.get(name)
         if not request_id:
             return {}
 
-        return {
+        extra = {
             "request_id": request_id,
             "protocol": self._protocol_name(),
             "kind": self._default_request_kind(),
         }
+
+        task_id = self._active_task_ids.get(name)
+        if task_id is not None:
+            extra["task_id"] = task_id
+
+        return extra

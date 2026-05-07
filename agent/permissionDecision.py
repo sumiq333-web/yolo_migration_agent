@@ -67,7 +67,41 @@ LOW_RISK_BACKGROUND_PREFIXES = (
     "python -m unittest",
 )
 
+WAIT_COMMAND_PATTERNS = (
+    "timeout",
+    "sleep",
+    "ping -n",
+    "start /wait",
+    "wait for engineer",
+    "wait for reviewer",
+    "wait for teammate",
+    "waiting for engineer",
+    "waiting for teammate",
+)
 
+def _is_wait_only_shell_command(command: str) -> bool:
+    cmd = str(command or "").strip().lower()
+    return any(pattern in cmd for pattern in WAIT_COMMAND_PATTERNS)
+
+def _is_wait_only_python_code(code: str) -> bool:
+    """
+    拦截只用于等待 teammate 的 Python 代码。
+
+    这里不是禁止所有 time.sleep，而是拦截明显的等待型脚本。
+    如果以后 run_python 被用于真实测试且包含 sleep，可以再细化白名单。
+    """
+    text = str(code or "").strip().lower()
+
+    wait_patterns = (
+        "time.sleep",
+        "asyncio.sleep",
+        "waiting for engineer",
+        "waiting for teammate",
+        "wait for engineer",
+        "wait for teammate",
+    )
+
+    return any(pattern in text for pattern in wait_patterns)
 
 def check_permission(tool_name: str, tool_input: dict) -> PermissionDecision:
     """
@@ -75,16 +109,43 @@ def check_permission(tool_name: str, tool_input: dict) -> PermissionDecision:
 
     Rules:
     1. Explicitly denied tools -> deny
-    2. Read-only / low-risk query tools -> allow
-    3. Low-risk agent state tools -> allow
-    4. Mutating user files / execution flow -> ask
-    5. Unknown tools -> ask
+    2. Waiting commands are denied before generic allow rules
+    3. Read-only / low-risk query tools -> allow
+    4. Low-risk agent state tools -> allow
+    5. Mutating user files / execution flow -> ask
+    6. Unknown tools -> ask
     """
     if tool_name in DENIED_TOOLS:
         return {
             "behavior": "deny",
             "reason": f"tool '{tool_name}' is disabled",
         }
+
+    # 必须放在 READ_ONLY_TOOLS 前面。
+    # 否则 run_python 属于 READ_ONLY_TOOLS，会被直接 allow。
+    if tool_name == "run_python":
+        code = str(tool_input.get("code", ""))
+        if _is_wait_only_python_code(code):
+            return {
+                "behavior": "deny",
+                "reason": (
+                    "Do not use Python sleep/wait code to wait for teammates. "
+                    "The runtime team message loop handles teammate waiting."
+                ),
+            }
+
+    # 必须放在 MUTATING_TOOLS 前面。
+    # 否则 run_shell 会进入 ask，而不是直接 deny 等待命令。
+    if tool_name == "run_shell":
+        cmd = str(tool_input.get("command", "")).lower()
+        if _is_wait_only_shell_command(cmd):
+            return {
+                "behavior": "deny",
+                "reason": (
+                    "Do not use shell commands to wait for teammates. "
+                    "The runtime team message loop handles teammate waiting."
+                ),
+            }
 
     if tool_name in READ_ONLY_TOOLS:
         return {

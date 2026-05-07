@@ -2,12 +2,22 @@ import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal
-
+from agent.task_plan_validator import validate_todos_against_task
 
 TaskStatus = Literal["pending", "in_progress", "blocked", "failed", "completed", "deleted"]
 
 VALID_STATUSES = {"pending", "in_progress", "blocked", "failed", "completed", "deleted"}
 TODO_STATUSES = {"pending", "in_progress", "completed", "failed", "blocked", "skipped"}
+# task 的终态。进入这些状态后，当前任务不应该再被 agent_loop 当成 active work。
+TERMINAL_STATUSES = {"completed", "failed", "deleted"}
+
+# 当前执行图里仍需要继续推进或等待收束的状态。
+ACTIVE_STATUSES = {"pending", "in_progress", "blocked"}
+
+# todo 层面的 resolved 状态。
+# 注意：failed/blocked todo 不算 resolved，必须由 leader 决定 task failed 或重试。
+RESOLVED_TODO_STATUSES = {"completed", "skipped"}
+BROKEN_TODO_STATUSES = {"failed", "blocked"}
 
 
 @dataclass
@@ -16,6 +26,14 @@ class TaskRecord:
     subject: str
     description: str = ""
     status: TaskStatus = "pending"
+
+    # 任务终态或阻塞态的解释原因。
+    # 例如：
+    # - completed: 可以为空，或者写验收说明
+    # - failed: 必须写失败原因
+    # - blocked: 建议写需要什么外部输入
+    status_reason: str = ""
+
     blockedBy: list[int] = field(default_factory=list)
     blocks: list[int] = field(default_factory=list)
     owner: str = ""
@@ -132,27 +150,84 @@ class TaskManager:
 
     # ---------- public mutation API ----------
 
-    def set_status(self, task_id: int, status: str) -> dict:
+    def set_status(
+            self,
+            task_id: int,
+            status: str,
+            reason: str = "",
+            cascade_failed: bool = False,
+    ) -> dict:
+        """
+        设置 task 状态。
+
+        设计原则：
+        1. completed 表示成功终止，必须所有 todo 都 completed/skipped。
+        2. failed 表示失败终止，可以存在 failed todo，但必须写 reason。
+        3. pending/in_progress 是非终态，agent_loop 不应该在这些状态下结束。
+        4. cascade_failed=True 时，leader 可以把当前 task 的下游依赖任务一起置为 failed。
+        """
+        status = str(status).strip().lower()
+        reason = str(reason or "").strip()
+
         if status not in VALID_STATUSES:
             raise ValueError(f"Invalid task status: {status}")
 
         task = self._load(task_id)
 
+        # 已经分配给 teammate 的 task 不允许回到 pending。
+        # retry 应该通过 dispatch_to_teammate(allow_retry=True)，而不是把 task 回滚到 pending。
+        if status == "pending" and task.owner:
+            raise ValueError(
+                f"Cannot reset task #{task_id} to pending while it is assigned to {task.owner}. "
+                "Use dispatch_to_teammate with allow_retry=true for retry, or create a new task."
+            )
+
+        # failed 是终态，必须有原因，方便最终向用户汇报，也方便后续审计。
+        if status == "failed" and not reason:
+            raise ValueError(
+                f"Cannot mark task #{task_id} as failed without a reason."
+            )
+
+        # completed 是成功终态，不能有 pending/in_progress/failed/blocked todo。
         if status == "completed" and task.todos:
-            undone = [t for t in task.todos if t["status"] not in ("completed", "skipped")]
-            broken = [t for t in task.todos if t["status"] in ("failed", "blocked")]
+            undone = [
+                t for t in task.todos
+                if t.get("status") not in RESOLVED_TODO_STATUSES
+            ]
+            broken = [
+                t for t in task.todos
+                if t.get("status") in BROKEN_TODO_STATUSES
+            ]
+
             if undone:
-                items = ", ".join(f"#{i}({t['status']}): {t['content']}" for i, t in enumerate(undone))
+                items = ", ".join(
+                    f"#{i}({t.get('status')}): {t.get('content')}"
+                    for i, t in enumerate(undone)
+                )
                 hint = ""
                 if broken:
-                    hint = f" ({len(broken)} broken — fix or skip them first)"
-                raise ValueError(f"Cannot complete: {len(undone)} todo(s) not resolved: {items}{hint}")
+                    hint = f" ({len(broken)} broken — mark task failed or retry instead)"
+                raise ValueError(
+                    f"Cannot complete: {len(undone)} todo(s) not resolved: {items}{hint}"
+                )
 
         task.status = status  # type: ignore[assignment]
+
+        # 只有提供 reason 时才覆盖，避免 completed 空 reason 抹掉历史信息。
+        # failed 强制有 reason，所以 failed 一定会落盘。
+        if reason:
+            task.status_reason = reason
+
         self._save(task)
 
         if status == "completed":
             self._unlock_tasks_blocked_by(task_id)
+
+        if status == "failed" and cascade_failed:
+            self._cascade_fail_tasks_blocked_by(
+                failed_id=task_id,
+                reason=reason,
+            )
 
         return self._to_public(self._load(task_id))
 
@@ -175,26 +250,74 @@ class TaskManager:
 
     def set_todos(self, task_id: int, todos: list[dict]) -> dict:
         task = self._load(task_id)
+        if task.owner and task.todos:
+            raise ValueError(
+                f"Cannot reset todos for task #{task_id} after assignment "
+                f"(owner={task.owner}, status={task.status}). "
+                "Use todo_update or create a new task instead."
+            )
+        validation = validate_todos_against_task(
+            subject=task.subject,
+            description=task.description,
+            todos=todos,
+            strict=True,
+        )
+        if not validation.ok:
+            raise ValueError("Invalid task todo plan:\n" + validation.render())
+
+        normalized_todos: list[dict] = []
+
         for i, item in enumerate(todos):
             content = str(item.get("content", "")).strip()
-            status = str(item.get("status", "pending")).lower()
+            active_form = str(item.get("activeForm", "")).strip()
+            status = str(item.get("status", "pending")).lower().strip()
+            reason = str(item.get("reason", "")).strip()
+
             if not content:
                 raise ValueError(f"Todo {i}: content required")
+
             if status not in TODO_STATUSES:
                 raise ValueError(f"Todo {i}: invalid status '{status}'")
-        task.todos = todos
+
+            if status in ("blocked", "failed") and not reason:
+                raise ValueError(f"Todo {i}: reason required for status '{status}'")
+
+            normalized = dict(item)
+            normalized["content"] = content
+            normalized["status"] = status
+
+            if active_form:
+                normalized["activeForm"] = active_form
+
+            if reason:
+                normalized["reason"] = reason
+
+            normalized_todos.append(normalized)
+
+        task.todos = normalized_todos
         self._save(task)
         return self._to_public(task)
 
     def update_todo_item(self, task_id: int, index: int, status: str, reason: str = "") -> dict:
         task = self._load(task_id)
+
         if index < 0 or index >= len(task.todos):
             raise ValueError(f"Todo index {index} out of range")
+
+        status = str(status).lower().strip()
+        reason = str(reason or "").strip()
+
         if status not in TODO_STATUSES:
             raise ValueError(f"Invalid todo status: {status}")
+
+        if status in ("blocked", "failed") and not reason:
+            raise ValueError(f"Todo reason required for status '{status}'")
+
         task.todos[index]["status"] = status
+
         if reason:
             task.todos[index]["reason"] = reason
+
         self._save(task)
         return self._to_public(task)
 
@@ -305,6 +428,58 @@ class TaskManager:
             ]
             self._save(task)
 
+    def _cascade_fail_tasks_blocked_by(
+            self,
+            failed_id: int,
+            reason: str,
+            visited: set[int] | None = None,
+    ) -> None:
+        """
+        当一个关键 task 失败时，把所有依赖它的下游 task 一起置为 failed。
+
+        注意：
+        - 只处理当前 task.blocks 中记录的下游任务。
+        - completed/deleted 任务不回滚。
+        - already failed 的任务不重复写。
+        - 用 visited 防止依赖图异常时递归死循环。
+        """
+        visited = visited or set()
+
+        if failed_id in visited:
+            return
+
+        visited.add(failed_id)
+
+        try:
+            failed_task = self._load(failed_id)
+        except ValueError:
+            return
+
+        for blocked_id in failed_task.blocks:
+            if blocked_id in visited:
+                continue
+
+            try:
+                blocked_task = self._load(blocked_id)
+            except ValueError:
+                continue
+
+            # 已经成功/删除/失败的任务不再覆盖。
+            if blocked_task.status not in {"completed", "deleted", "failed"}:
+                blocked_task.status = "failed"
+                blocked_task.status_reason = (
+                    f"Upstream task #{failed_id} failed, so this dependent task cannot proceed. "
+                    f"Upstream failure reason: {reason}"
+                )
+                self._save(blocked_task)
+
+            # 继续向下游传播失败。
+            self._cascade_fail_tasks_blocked_by(
+                failed_id=blocked_id,
+                reason=reason,
+                visited=visited,
+            )
+
     def repair_graph(self) -> dict:
         """
         Optional maintenance tool.
@@ -367,10 +542,10 @@ class TaskManager:
             blocked = f" blockedBy={task.blockedBy}" if task.blockedBy else ""
             blocks = f" blocks={task.blocks}" if task.blocks else ""
             owner = f" owner={task.owner}" if task.owner else ""
-
+            reason = f" reason={task.status_reason}" if task.status_reason else ""
             lines.append(
                 f"{marker} #{task.id}: {task.subject}"
-                f"{owner}{blocked}{blocks}"
+                f"{owner}{blocked}{blocks}{reason}"
             )
 
         return "\n".join(lines)

@@ -174,20 +174,37 @@ def build_engineer_profile(
         },
     ]
 
-    def _handle_todo_update(sender, task_manager, get_task_id_fn, index, status, reason=""):
+    def _handle_todo_update(
+            sender: str,
+            task_manager,
+            get_task_id_fn,
+            index,
+            status,
+            reason: str = "",
+    ) -> str:
         task_id = get_task_id_fn(sender) if get_task_id_fn else None
+
         if task_id is None:
-            return "Error: no active task assigned to you. Wait for a dispatch."
-        task = task_manager.get(int(task_id))
-        if task["owner"] != sender:
-            return f"Error: task #{task_id} is not assigned to {sender}"
-        try:
-            return json.dumps(
-                task_manager.update_todo_item(int(task_id), int(index), status, reason or ""),
-                ensure_ascii=False, indent=2,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
+            raise ValueError("no active task assigned to you. Wait for a dispatch.")
+
+        task_id = int(task_id)
+        todo_index = int(index)
+        status = str(status).strip().lower()
+        reason = str(reason or "").strip()
+
+        task = task_manager.get(task_id)
+
+        if task.get("owner") != sender:
+            raise ValueError(f"task #{task_id} is not assigned to {sender}")
+
+        updated = task_manager.update_todo_item(
+            task_id=task_id,
+            index=todo_index,
+            status=status,
+            reason=reason,
+        )
+
+        return json.dumps(updated, ensure_ascii=False, indent=2)
 
     handlers = {
         "scan_yolo_project": lambda sender, **kw: str(

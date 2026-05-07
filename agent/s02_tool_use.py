@@ -180,32 +180,51 @@ def maybe_mark_prompt_dirty(tool_name: str, tool_output: str) -> None:
         return
 
     PROMPT_BUILDER.mark_stable_dirty()
+
+def _is_task_already_assigned_to(task: dict, teammate: str) -> bool:
+    return(
+                task.get("owner") == teammate
+                and task.get("status") in ("in_progress", "blocked", "failed")
+    )
 # -- The dispatch map: {tool_name: handler} --
 def _handle_dispatch(kw: dict) -> str:
     """Dispatch a task to a teammate. If task_id is set, assign owner + in_progress first."""
     task_id = kw.get("task_id")
     to = kw["to"]
+    allow_retry = bool(kw.get("allow_retry", False))
+
     if task_id is not None:
         try:
             task = TASK_MANAGER.get(int(task_id))
+
             if not task.get("workspace"):
                 return "Error: cannot dispatch task without workspace. Call task_set_workspace first."
+
             if not task.get("todos"):
                 return "Error: cannot dispatch task without todos. Call task_set_todos first."
+
+            if _is_task_already_assigned_to(task, to) and not allow_retry:
+                return (
+                    f"Error: task #{task_id} is already assigned to {to} "
+                    f"with status={task.get('status')}. "
+                    "Do not redispatch unless the user explicitly asks to retry and allow_retry=true."
+                )
+
             TASK_MANAGER.assign(int(task_id), to)
             TASK_MANAGER.set_status(int(task_id), "in_progress")
+
         except ValueError as e:
             return f"Error: {e}"
+
     return TEAM_MANAGER.dispatch(
         to=to,
         content=_build_dispatch_content(kw),
         msg_type="task_request",
     )
 
-
 def _build_dispatch_content(kw: dict) -> str:
     """If task_id is present, embed task context in the dispatch message."""
-    content = kw["content"]
+    content = kw.get("content", "")
     task_id = kw.get("task_id")
     if task_id is None:
         return content
@@ -228,6 +247,39 @@ def _build_dispatch_content(kw: dict) -> str:
         f"{content}"
     )
 
+def _looks_like_team_wait_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    patterns = (
+        "wait for engineer",
+        "wait for reviewer",
+        "wait for experiment_runner",
+        "wait for teammate",
+        "waiting for engineer",
+        "waiting for teammate",
+        "check engineer",
+        "check teammate",
+        "read inbox",
+        "team inbox",
+        "follow-up response",
+        "teammate response",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
+def _handle_schedule_after(kw: dict) -> str:
+    prompt = str(kw.get("prompt", ""))
+
+    if _looks_like_team_wait_prompt(prompt):
+        return (
+            "Error: schedule_after must not be used to wait for teammate responses. "
+            "The runtime team message loop handles teammate waiting."
+        )
+
+    return CRON_SCHEDULER.create_after(
+        kw["delay_seconds"],
+        prompt,
+        kw.get("durable", False),
+    )
 
 def auto_compact_for_recovery(messages: list) -> list:
     compacted_messages, _changed = micro_compact_messages(messages)
@@ -267,8 +319,10 @@ TOOL_HANDLERS = {
     "task_get": lambda **kw: TASK_MANAGER.get(kw["id"]),
     "task_ready": lambda **kw: TASK_MANAGER.render_ready(),
     "task_set_status": lambda **kw: TASK_MANAGER.set_status(
-        kw["id"],
-        kw["status"],
+    kw["id"],
+    kw["status"],
+    kw.get("reason", ""),
+    kw.get("cascade_failed", False),
     ),
     "task_set_workspace": lambda **kw: json.dumps(
         TASK_MANAGER.set_workspace(kw["task_id"], kw["path"]),
@@ -294,11 +348,7 @@ TOOL_HANDLERS = {
     ),
     "cron_delete": lambda **kw: CRON_SCHEDULER.delete(kw["id"]),
     "cron_list": lambda **kw: CRON_SCHEDULER.list_tasks(),
-    "schedule_after": lambda **kw: CRON_SCHEDULER.create_after(
-        kw["delay_seconds"],
-        kw["prompt"],
-        kw.get("durable", False),
-    ),
+    "schedule_after": lambda **kw: _handle_schedule_after(kw),
     "team_init": lambda **kw: TEAM_MANAGER.ensure_default_team(),
     "list_teammates": lambda **kw: TEAM_MANAGER.list_all(),
     "wake_teammate": lambda **kw: TEAM_MANAGER.wake(kw["name"]),
@@ -562,14 +612,33 @@ TOOLS = [
 },
 {
     "name": "task_set_status",
-    "description": "Set the status of one persistent task.",
+    "description": (
+        "Set the terminal or runtime status of one persistent task. "
+        "Use status='completed' only for successful completion. "
+        "Use status='failed' when the task cannot be completed under current constraints. "
+        "Failed status requires a reason."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
             "id": {"type": "integer"},
             "status": {
                 "type": "string",
-                "enum": ["pending", "in_progress", "completed", "deleted"],
+                "enum": ["pending", "in_progress", "blocked", "failed", "completed", "deleted"],
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required when status='failed'. "
+                    "Explain the failed todo, failed tool, root cause, and whether retry was considered."
+                ),
+            },
+            "cascade_failed": {
+                "type": "boolean",
+                "description": (
+                    "When status='failed', set true to mark downstream tasks that depend on this task as failed too. "
+                    "Use this only when the failed task is critical for its blocked tasks."
+                ),
             },
         },
         "required": ["id", "status"],
@@ -590,9 +659,10 @@ TOOLS = [
 {
     "name": "task_set_todos",
     "description": (
-        "Set the todo list for a task. "
-        "Use this before dispatching a task to a teammate. "
-        "Each todo item needs content, status (pending/in_progress/completed/failed/blocked/skipped), and activeForm."
+        "Set todos for a task. Todos must be executable, verifiable, and safe. "
+        "Multi-file tasks must start with target resolution. "
+        "Every file target mentioned in the task subject or description must be explicitly covered. "
+        "Invalid todo plans are rejected by validation."
     ),
     "input_schema": {
         "type": "object",
@@ -791,7 +861,8 @@ TOOLS = [
         "Create one tracked assignment request, send it from lead to a fixed teammate, "
         "attach a request_id, and wake that teammate if needed. "
         "Use this for normal teammate task dispatch. "
-        "Include task_id to send the task and its todos to the teammate."
+        "Include task_id to send the task and its todos to the teammate. "
+        "Do not redispatch an already assigned task unless allow_retry=true and the user explicitly asked to retry."
     ),
     "input_schema": {
         "type": "object",
@@ -805,8 +876,12 @@ TOOLS = [
                 "type": "integer",
                 "description": "Task ID to dispatch. The task's todos will be sent with it.",
             },
+            "allow_retry": {
+                "type": "boolean",
+                "description": "Only true when the user explicitly asks to retry the same task.",
+            },
         },
-        "required": ["to", "content"],
+        "required": ["to"],
     },
 },
 {
@@ -974,10 +1049,23 @@ def sync_requests_from_lead_inbox(inbox: list[dict]) -> None:
             print(f"[RequestStore] {e}")
 
 def _has_active_tasks() -> bool:
+    """
+    当前执行图只允许在 task 进入 terminal 状态后结束。
+
+    terminal:
+    - completed：成功终止
+    - failed：失败终止
+    - deleted：删除/忽略
+
+    non-terminal:
+    - pending：已进入当前执行图，但尚未调度
+    - in_progress：正在执行
+    - blocked：当前先视为未收束，需要 leader 决策 failed / retry / ask user
+    """
     for f in TASKS_DIR.glob("task_*.json"):
         try:
             t = json.loads(f.read_text(encoding="utf-8"))
-            if t.get("status") in ("pending", "in_progress"):
+            if t.get("status") in ("pending", "in_progress", "blocked"):
                 return True
         except Exception:
             pass

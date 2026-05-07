@@ -169,6 +169,9 @@ def _build_denied_output(
 
     return output, meta, "denied", reason
 
+def _looks_like_tool_error(value: Any) -> bool:
+    text = str(value).lstrip()
+    return text.startswith("Error:") or text.startswith("ERROR:")
 
 def _execute_allowed_tool(
     *,
@@ -182,6 +185,11 @@ def _execute_allowed_tool(
 ) -> tuple[str, dict[str, Any], ToolExecutionStatus, str]:
     """
     Execute a tool handler and run after_tool_execute hooks.
+
+    Important:
+    - handler raises exception      -> tool_error
+    - handler returns "Error: ..."  -> tool_error
+    - normal handler output         -> executed
     """
 
     handler = tool_handlers.get(tool_name)
@@ -197,8 +205,15 @@ def _execute_allowed_tool(
             else:
                 raw_output = handler(tool_actor, **tool_input)
 
-            status = "executed"
-            reason = ""
+            raw_output = str(raw_output)
+
+            if _looks_like_tool_error(raw_output):
+                status = "tool_error"
+                reason = raw_output.strip()[:1000]
+            else:
+                status = "executed"
+                reason = ""
+
         except Exception as e:
             raw_output = f"Error: {e}"
             status = "tool_error"
@@ -221,7 +236,6 @@ def _execute_allowed_tool(
     meta = event_after.payload.get("output_meta", _raw_meta())
 
     return str(output), _normalize_meta(meta), status, reason
-
 
 def _control_meta(*, summary: str) -> dict[str, Any]:
     return {

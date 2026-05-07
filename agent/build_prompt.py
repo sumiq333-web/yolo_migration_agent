@@ -131,11 +131,18 @@ class SystemPromptBuilder:
     You MUST use tools to solve the task. Do NOT answer with free-form text.
 
     Rules:
-    - You MUST first find available skill and read skill if it exists then call the todo tool.
+    - You MUST first find available skill and read skill if it exists, then call the todo tool.
     - Do NOT directly answer the question without using tools.
     - If you have not used a tool yet, your next message MUST be a tool call.
     - Only update todo when progress changes significantly.
-    - Before dispatching a task that requires code modification (write_file, edit_file, bash), ask the user to confirm. Summarize what will be changed and which files are affected, then wait for the user's approval before calling dispatch_to_teammate.
+    - Before dispatching a task that requires code modification (write_file, edit_file, run_shell, run_python), ask the user to confirm. Summarize what will be changed and which files are affected, then wait for the user's approval before calling dispatch_to_teammate.
+
+    Team waiting rules:
+    - Never use run_shell, run_python, background_run, schedule_after, cron_create, sleep, timeout, ping, or any command only to wait for teammate responses.
+    - Waiting for teammate responses is handled by the runtime team message loop, not by tools.
+    - After dispatch_to_teammate, stop the current tool sequence and let the runtime wait for lead inbox messages.
+    - Use read_inbox only after control returns to the lead.
+    - Do not use task_set_todos after dispatch to rewrite task evidence or bypass failed todos.
     """.strip()
 
     def _build_tool_listing(self) -> str:
@@ -150,44 +157,67 @@ class SystemPromptBuilder:
         return "\n".join(lines)
 
     def _build_task_execution_protocol(self) -> str:
-            has_task_tools = any(
-                tool.get("name", "").startswith("task_")
-                for tool in self.tools
-            )
+        has_task_tools = any(
+            tool.get("name", "").startswith("task_")
+            for tool in self.tools
+        )
 
-            if not has_task_tools:
-                return ""
+        if not has_task_tools:
+            return ""
 
-            return """
+        return """
     # Persistent task execution protocol
 
     Persistent tasks are durable work items, not runtime workers.
 
-    Task-state rules:
-    - task_create_graph creates or updates the long-term task graph.
-    - task_ready reports pending tasks that have no remaining blockers.
-    - A task can be ready while its status is still pending.
-    - When the user asks to start, continue, execute, analyze, implement, or work on a ready task, first call task_get to inspect that task.
-    - Before doing actual work for that task, call task_set_status with status="in_progress".
-    - Convert the selected task into the current todo plan before using analysis, file-reading, or code-navigation tools.
-    - Only call task_set_status with status="completed" after the task's concrete work is actually finished.
-    - After completing a task, call task_ready to report newly unblocked tasks.
+    Task lifecycle:
+    - pending means the task is part of the current execution graph but has not started yet.
+    - in_progress means the task is currently being executed or waiting for teammate result.
+    - completed is the successful terminal status.
+    - failed is the unsuccessful terminal status.
+    - deleted is ignored/removed.
+    - Do not end the agent loop while any current task is pending, in_progress, or blocked.
+    - Before ending, every current task must be completed, failed, or deleted.
 
-    Intent boundary:
-    - If the user only asks to create, list, inspect, or plan tasks, report task state and do not begin execution.
-    - If the user explicitly asks to start or continue a ready task, claim it with in_progress and proceed.
+    Task-state rules:
+    - task_create_graph creates or updates the task graph.
+    - task_ready reports pending tasks that have no remaining blockers.
+    - Before doing actual work for a task, inspect it with task_get and move it to in_progress.
+    - Only call task_set_status(status="completed") when the task succeeded and all todos are completed or skipped.
+    - If a task cannot be completed under current constraints, call task_set_status(status="failed", reason=...).
+    - Failed is terminal but not success.
+    - Do not call task_set_status(status="completed") while any todo is failed or blocked.
+    - Do not call task_set_todos after dispatch to rewrite task evidence or bypass failed todos.
 
     Workspace rules:
-    - Before creating a task that involves file access, use task_set_workspace to set the YOLO repository root.
-    - A task without workspace cannot be dispatched. task_set_workspace persists the path and activates it for the current process.
+    - Before creating or dispatching a task that involves file access, set the task workspace with task_set_workspace.
+    - A task without workspace cannot be dispatched.
+    - task_set_workspace persists the path and activates it for the current process.
 
     Teammate dispatch rules:
     - After dispatching a task to a teammate via dispatch_to_teammate, the task enters in_progress with the teammate as owner.
-    - The teammate will work autonomously and send results to your inbox.
-    - Do NOT tell the user the task is finished after dispatching. Instead, wait.
-    - Use read_inbox to check for teammate responses (task_result, error, review_result, experiment_result).
-    - When a task_result arrives, review it and report to the user. If the result is satisfactory, call task_set_status with status="completed".
-    - If an error arrives, report the failure to the user and call task_set_status with status="pending" for retry.
+    - The teammate works autonomously and sends task_result or error to the lead inbox.
+    - Do not tell the user the task is finished immediately after dispatching.
+    - Do not use shell commands, Python snippets, background jobs, cron jobs, schedules, sleep, or timeout to wait for teammate responses.
+    - After dispatch_to_teammate, stop the current tool sequence and let the runtime team message loop wait.
+    - Use read_inbox only after control returns to the lead.
+
+    Teammate error handling:
+    - When a teammate error arrives, inspect the task, failed todo, failed tool, and error reason.
+    - First decide whether the failure is repairable.
+    - Repairable errors include wrong path, stale workspace, missing validation command, temporary environment issue, or a failed todo that can be retried without changing user intent.
+    - Non-repairable errors include missing required target, unsupported capability, permission denial, user constraint conflict, or a tool_error that proves the requested operation cannot be completed safely.
+    - If the failure is repairable and the existing todo plan is still valid, retry with dispatch_to_teammate(allow_retry=true) and a clear retry instruction.
+    - If repair requires changing the plan, create a new task or ask the user. Do not rewrite todos of an already dispatched task.
+    - If the failure is not repairable, call task_set_status(status="failed", reason=...).
+    - If the failed task is critical for downstream tasks, call task_set_status(status="failed", reason=..., cascade_failed=true) so dependent tasks fail too.
+    - After setting a task to failed, report the final failed status and reason to the user.
+
+    Final reporting rules:
+    - Before ending, always report the final task status to the user.
+    - For completed tasks, report changed files, verification results, and final outcome.
+    - For failed tasks, report task id, failed todo, failed tool, root cause, retryability, and whether files were changed.
+    - For cascaded failures, report which downstream tasks were failed and why.
     """.strip()
 
     def _build_skill_listing(self) -> str:
