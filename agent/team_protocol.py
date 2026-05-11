@@ -12,6 +12,7 @@ TERMINAL_STATUSES = {
     "failed",
     "rejected",
     "expired",
+    "cancelled",
 }
 
 VALID_STATUSES = {
@@ -20,6 +21,7 @@ VALID_STATUSES = {
     "failed",
     "rejected",
     "expired",
+    "cancelled",
 }
 
 
@@ -153,6 +155,26 @@ class RequestStore:
             payload=payload,
         )
 
+    def cancel_request(
+        self,
+        *,
+        request_id: str,
+        reason: str = "Request cancelled.",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Mark one request as cancelled.
+
+        Cancelled means lead intentionally stopped an open request before retrying
+        or changing direction. It is terminal, but not the same as failed.
+        """
+        return self._set_status(
+            request_id=request_id,
+            status="cancelled",
+            reason=reason,
+            payload=payload,
+        )
+
     def get_request(self, request_id: str) -> dict[str, Any]:
         """
         Get one request by id.
@@ -217,6 +239,7 @@ class RequestStore:
                 "failed": "[!]",
                 "rejected": "[-]",
                 "expired": "[~]",
+                "cancelled": "[/]",
             }.get(status, "[?]")
 
             request_id = item.get("request_id", "")
@@ -344,3 +367,49 @@ class RequestStore:
             return record
 
         return None
+
+    def find_open_request_for_task(
+            self,
+            *,
+            to: str,
+            task_id: int,
+            kind: str = "assignment",
+    ) -> dict[str, Any] | None:
+        """
+        Find an open tracked request for the same task and teammate.
+
+        This prevents multiple pending assignment requests for one task when the
+        lead sends slightly different retry/correction text. It checks both
+        payload.task_id and the embedded <task-context> content for backward
+        compatibility with older requests.
+        """
+        data = self._load()
+        wanted_task_id = int(task_id)
+
+        for record in data["requests"].values():
+            if record.get("status") in TERMINAL_STATUSES:
+                continue
+            if record.get("to") != to:
+                continue
+            if record.get("kind") != kind:
+                continue
+
+            payload = record.get("payload", {}) or {}
+            payload_task_id = payload.get("task_id")
+            if payload_task_id is not None:
+                try:
+                    if int(payload_task_id) == wanted_task_id:
+                        return record
+                except Exception:
+                    pass
+
+            content = str(record.get("content", ""))
+            marker = '"task_id"'
+            if marker in content:
+                import re
+                m = re.search(r'"task_id"\s*:\s*(\d+)', content)
+                if m and int(m.group(1)) == wanted_task_id:
+                    return record
+
+        return None
+

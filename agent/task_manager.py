@@ -188,17 +188,14 @@ class TaskManager:
                 f"Cannot mark task #{task_id} as failed without a reason."
             )
 
-        # failed 是失败终态；进入 failed 后，未执行完的 pending/in_progress todo 自动收束为 skipped。
+        # completed 是成功终态，不能有 pending/in_progress/failed/blocked todo。
         if status == "failed" and task.todos:
             for i, todo in enumerate(task.todos):
-                # 兼容历史数据或手动编辑造成的大小写/空格问题
-                todo_status = str(todo.get("status", "")).strip().lower()
-
-                if todo_status in ("pending", "in_progress"):
+                if todo.get("status") in ("pending", "in_progress"):
                     task.todos[i]["status"] = "skipped"
                     task.todos[i]["reason"] = (
-                            f"Skipped because parent task #{task_id} was set to failed"
-                            + (f": {reason}" if reason else ".")
+                        f"Skipped because parent task #{task_id} was set to failed"
+                        + (f": {reason}" if reason else ".")
                     )
 
         if status == "completed" and task.todos:
@@ -262,11 +259,15 @@ class TaskManager:
 
     def set_todos(self, task_id: int, todos: list[dict]) -> dict:
         task = self._load(task_id)
-        if task.owner and task.todos:
+        if task.todos:
             raise ValueError(
-                f"Cannot reset todos for task #{task_id} after assignment "
-                f"(owner={task.owner}, status={task.status}). "
+                f"Cannot reset todos for task #{task_id} because todos already exist. "
                 "Use todo_update or create a new task instead."
+            )
+        if task.status != "pending":
+            raise ValueError(
+                f"Cannot set initial todos for task #{task_id} after it has started "
+                f"(status={task.status}). Use todo_update or create a new task instead."
             )
         validation = validate_todos_against_task(
             subject=task.subject,
@@ -290,6 +291,12 @@ class TaskManager:
 
             if status not in TODO_STATUSES:
                 raise ValueError(f"Todo {i}: invalid status '{status}'")
+
+            if status != "pending":
+                raise ValueError(
+                    f"Todo {i}: initial status must be 'pending', got '{status}'. "
+                    "Use todo_update after dispatch to record progress."
+                )
 
             if status in ("blocked", "failed") and not reason:
                 raise ValueError(f"Todo {i}: reason required for status '{status}'")

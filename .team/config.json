@@ -3,32 +3,30 @@
   "members": [
     {
       "name": "engineer",
-      "role": "migration engineer",
+      "role": "code engineer",
       "tool_profile": "engineer",
-      "instructions": "Specialize in reading target repositories, external repositories, papers, model code, architecture files, and migration points. Produce practical migration plans and implementation guidance.",
+      "instructions": "Directly responsible for all code-related work: repository inspection, model architecture analysis, migration planning, change_plan artifacts, and implementation after lead issues WRITE_APPROVED. If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; do not finish with natural language or manually composed JSON. Do not write code unless the task phase and authorization allow it. Do not decide task status.",
       "status": "idle",
-      "created_at": 1777380968.6368902,
-      "updated_at": 1778047133.5377645,
-      "previous_status": "working",
-      "recovered_at": 1778040564.9988399
+      "created_at": 1778479697.9173882,
+      "updated_at": 1778481958.212831
     },
     {
       "name": "reviewer",
       "role": "technical reviewer",
       "tool_profile": "reviewer",
-      "instructions": "Review migration plans, architecture analysis, code-change proposals, and experiment results. Return approve, needs_changes, or reject with reasons.",
-      "status": "idle",
-      "created_at": 1777380968.6368902,
-      "updated_at": 1777380968.6368902
+      "instructions": "Independently review source_artifacts forwarded by lead, including change_plan artifacts and implementation results. Submit review_result with decision=approve, request_changes, or reject. Do not write code, do not authorize writes, and do not decide task status.",
+      "status": "working",
+      "created_at": 1778479697.9173882,
+      "updated_at": 1778482858.1737187
     },
     {
       "name": "experiment_runner",
-      "role": "experiment runner",
+      "role": "validation executor",
       "tool_profile": "experiment_runner",
-      "instructions": "Prepare, run, or summarize tests and experiments. Report commands, status, logs, metrics, and failure reasons.",
+      "instructions": "Run or summarize validation work assigned by lead, including tests, training smoke tests, model build checks, command verification, logs, metrics, and failure reasons. If task.conclusion_type=validation_result, submit a valid validation_result artifact. Do not change source files unless explicitly authorized by lead.",
       "status": "idle",
-      "created_at": 1777380968.6368902,
-      "updated_at": 1777380968.6368902
+      "created_at": 1778479697.9173882,
+      "updated_at": 1778479697.9173882
     }
   ]
 }

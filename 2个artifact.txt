@@ -1,0 +1,474 @@
+对，现在先只定两个 artifact：
+
+```text id="9h5tve"
+1. change_plan：engineer 写前提交的修改方案
+2. review_result：reviewer 对某个 artifact 的评审结论
+```
+
+这两个够支撑第一版 `proposal -> review -> leader 决策`。
+`implementation_result` 后面再定，不要现在一起扩。
+
+---
+
+## 1. 通用 envelope 字段
+
+我建议两个 artifact 都统一有一层公共字段，方便 `RequestStore.result` 里存，也方便后续查来源。你现在已经有 `REQUEST_STORE` 和 `TEAM_BUS`，而 lead 同步 inbox 时会把 `task_result` 写入 `complete_request(result=content)`，所以第一版 artifact 放 `RequestStore.result` 是贴合现有代码的。
+
+公共字段：
+
+```json id="5z4n7v"
+{
+  "artifact_type": "change_plan | review_result",
+  "artifact_version": "v1",
+  "producer": "engineer | reviewer | leader",
+  "task_id": 1,
+  "request_id": "req_xxx",
+  "created_at": "optional-iso-time",
+  "summary": "一句话总结"
+}
+```
+
+### 字段解释
+
+```text id="r8x9m4"
+artifact_type：
+  区分这是 change_plan 还是 review_result。
+
+artifact_version：
+  先固定 v1，后面字段变更时不污染历史 result。
+
+producer：
+  谁产出的。change_plan 通常是 engineer，review_result 通常是 reviewer。
+
+task_id：
+  这个 artifact 对应哪个 task。
+
+request_id：
+  这个 artifact 是哪一次 dispatch/request 的结果。
+  第一版如果 teammate 拿不到 request_id，也可以由 lead 在入库时补。
+
+created_at：
+  可选，不要第一版强依赖时间。
+
+summary：
+  必填。给 lead 快速判断用。
+```
+
+---
+
+# Artifact 1：change_plan
+
+`change_plan` 是 engineer 在**写前**提交的“可评审修改方案”。
+
+它不能太粗，也不能要求贴完整 patch。
+它的目标是让 reviewer 能判断：
+
+```text id="nm1dpo"
+是否符合任务边界
+是否最小改动
+是否可以授权进入 implementation
+```
+
+## change_plan 字段
+
+```json id="1x5xyk"
+{
+  "artifact_type": "change_plan",
+  "artifact_version": "v1",
+  "producer": "engineer",
+  "task_id": 1,
+  "request_id": "req_engineer_plan_xxx",
+  "summary": "计划通过新增实验配置接入 YOLOv11 backbone，不直接覆盖原 YOLOv8 配置。",
+
+  "goal": "本次修改要达成的目标",
+  "non_goals": [
+    "明确不做的事情"
+  ],
+
+  "current_state": {
+    "observed_files": [
+      "当前已确认相关的文件"
+    ],
+    "relevant_symbols": [
+      "当前已确认相关的类/函数/配置段"
+    ],
+    "notes": [
+      "当前状态判断"
+    ]
+  },
+
+  "target_files": [
+    {
+      "path": "预计新增或修改的文件路径",
+      "operation": "create | edit | delete | inspect_only",
+      "reason": "为什么需要动这个文件"
+    }
+  ],
+
+  "forbidden_files": [
+    {
+      "path": "禁止修改的文件或目录",
+      "reason": "为什么禁止"
+    }
+  ],
+
+  "mutation_strategy": {
+    "mode": "copy_new | edit_existing",
+    "reason": "为什么选择复制新增或直接修改"
+  },
+
+  "approach": [
+    "按步骤描述准备怎么改"
+  ],
+
+  "compatibility_checks": [
+    "写前已经考虑的兼容性问题"
+  ],
+
+  "risk_points": [
+    {
+      "risk": "风险描述",
+      "mitigation": "规避方式"
+    }
+  ],
+
+  "validation_plan": [
+    {
+      "check": "验证项",
+      "command_or_method": "验证命令或验证方式",
+      "success_criteria": "什么算通过"
+    }
+  ],
+
+  "rollback_plan": [
+    "失败后如何回滚"
+  ],
+
+  "open_questions": [
+    "仍不确定、需要 reviewer/leader 判断的问题"
+  ]
+}
+```
+
+## change_plan 必填字段
+
+第一版我建议强制这些必填：
+
+```text id="duqxtw"
+artifact_type
+artifact_version
+producer
+task_id
+summary
+goal
+non_goals
+target_files
+forbidden_files
+mutation_strategy
+approach
+validation_plan
+rollback_plan
+```
+
+`current_state / compatibility_checks / risk_points / open_questions` 很重要，但可以先不做硬校验，否则 schema 太重。
+
+---
+
+# Artifact 2：review_result
+
+`review_result` 是 reviewer 对某个 source artifact 的结构化评审结论。
+
+它不是 message status。
+它的 `decision=reject` 也不等于 request rejected。request 仍然是 completed，因为 reviewer 成功完成了评审。当前 `sync_requests_from_lead_inbox()` 已经把 `task_result/error/rejected/expired` 映射到 RequestStore 的不同收束方法，后面只需要新增 `review_result -> complete_request`。
+
+## review_result 字段
+
+```json id="v11bgq"
+{
+  "artifact_type": "review_result",
+  "artifact_version": "v1",
+  "producer": "reviewer",
+  "task_id": 2,
+  "request_id": "req_reviewer_plan_xxx",
+  "summary": "方案符合边界，可以进入实现。",
+
+  "review_type": "plan | diff | validation | general",
+
+  "source": {
+    "artifact_type": "change_plan",
+    "task_id": 1,
+    "request_id": "req_engineer_plan_xxx",
+    "producer": "engineer"
+  },
+
+  "decision": "approve | request_changes | reject",
+
+  "blocking_findings": [
+    {
+      "title": "阻塞问题标题",
+      "detail": "为什么阻塞",
+      "file": "可选，关联文件",
+      "required_change": "必须怎么改"
+    }
+  ],
+
+  "non_blocking_findings": [
+    {
+      "title": "非阻塞问题标题",
+      "detail": "说明",
+      "file": "可选，关联文件"
+    }
+  ],
+
+  "required_changes": [
+    "decision=request_changes 时必须列出"
+  ],
+
+  "approved_scope": {
+    "approved_files": [
+      "允许后续 implementation 修改的文件"
+    ],
+    "forbidden_files": [
+      "后续 implementation 禁止修改的文件"
+    ],
+    "approved_operations": [
+      "create",
+      "edit"
+    ]
+  },
+
+  "conditions": [
+    "approve 时附带的条件；如果没有就空数组"
+  ]
+}
+```
+
+## review_result 必填字段
+
+第一版建议强制这些：
+
+```text id="alpxox"
+artifact_type
+artifact_version
+producer
+task_id
+summary
+review_type
+source
+decision
+blocking_findings
+non_blocking_findings
+required_changes
+approved_scope
+```
+
+---
+
+## 2. review_result 的决策规则
+
+这里必须定死，不然 reviewer 输出会很模糊。
+
+### decision = approve
+
+含义：
+
+```text id="g15a5y"
+source artifact 可以进入下一步。
+```
+
+要求：
+
+```text id="h5ww95"
+blocking_findings 必须为空
+required_changes 必须为空
+approved_scope.approved_files 不能为空，除非 review_type 不是 plan/diff
+```
+
+注意：
+
+```text id="h8m949"
+approve 不等于 WRITE_APPROVED。
+approve 只是 reviewer 结论。
+WRITE_APPROVED 仍然只能由 leader 发。
+```
+
+---
+
+### decision = request_changes
+
+含义：
+
+```text id="iy5c7q"
+source artifact 方向可能可行，但必须修改后再继续。
+```
+
+要求：
+
+```text id="59fwh5"
+required_changes 必须非空
+blocking_findings 可以非空
+approved_scope 可以为空
+```
+
+这个时候 lead 不应该授权写。
+
+---
+
+### decision = reject
+
+含义：
+
+```text id="7k70lf"
+source artifact 方向不成立，或明显违反任务边界。
+```
+
+要求：
+
+```text id="9lqsln"
+blocking_findings 必须非空
+required_changes 可以为空
+approved_scope 应该为空
+```
+
+这个时候 lead 应该考虑 failed / 缩小 scope / 问用户。
+
+---
+
+## 3. 两个 artifact 的最小版本
+
+如果你想第一版更轻，我建议可以压缩成下面这样。
+
+### change_plan v1 最小版
+
+```json id="1nn68z"
+{
+  "artifact_type": "change_plan",
+  "artifact_version": "v1",
+  "producer": "engineer",
+  "task_id": 1,
+  "request_id": "req_xxx",
+  "summary": "...",
+
+  "goal": "...",
+  "non_goals": ["..."],
+
+  "target_files": [
+    {
+      "path": "...",
+      "operation": "create | edit | delete | inspect_only",
+      "reason": "..."
+    }
+  ],
+
+  "forbidden_files": [
+    {
+      "path": "...",
+      "reason": "..."
+    }
+  ],
+
+  "mutation_strategy": {
+    "mode": "copy_new | edit_existing",
+    "reason": "..."
+  },
+
+  "approach": ["..."],
+
+  "validation_plan": [
+    {
+      "check": "...",
+      "command_or_method": "...",
+      "success_criteria": "..."
+    }
+  ],
+
+  "rollback_plan": ["..."]
+}
+```
+
+### review_result v1 最小版
+
+```json id="sgsfud"
+{
+  "artifact_type": "review_result",
+  "artifact_version": "v1",
+  "producer": "reviewer",
+  "task_id": 2,
+  "request_id": "req_xxx",
+  "summary": "...",
+
+  "review_type": "plan | diff | validation | general",
+
+  "source": {
+    "artifact_type": "change_plan",
+    "task_id": 1,
+    "request_id": "req_source_xxx",
+    "producer": "engineer"
+  },
+
+  "decision": "approve | request_changes | reject",
+
+  "blocking_findings": [
+    {
+      "title": "...",
+      "detail": "...",
+      "file": "...",
+      "required_change": "..."
+    }
+  ],
+
+  "non_blocking_findings": [
+    {
+      "title": "...",
+      "detail": "...",
+      "file": "..."
+    }
+  ],
+
+  "required_changes": ["..."],
+
+  "approved_scope": {
+    "approved_files": ["..."],
+    "forbidden_files": ["..."],
+    "approved_operations": ["create", "edit"]
+  }
+}
+```
+
+---
+
+## 4. 我建议最终先采用这个字段集
+
+不要再缩了，再缩 reviewer 就没法评；也不要再加了，再加 leader 和 teammate 会负担太重。
+
+最终先定：
+
+```text id="sl3f23"
+change_plan:
+  通用字段 +
+  goal
+  non_goals
+  target_files
+  forbidden_files
+  mutation_strategy
+  approach
+  validation_plan
+  rollback_plan
+
+review_result:
+  通用字段 +
+  review_type
+  source
+  decision
+  blocking_findings
+  non_blocking_findings
+  required_changes
+  approved_scope
+```
+
+这两个 artifact 第一版就够了。
+后面等 implementation 阶段跑通，再定第三个：
+
+```text id="8mss9t"
+implementation_result
+```

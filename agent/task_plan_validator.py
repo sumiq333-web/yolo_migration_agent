@@ -277,3 +277,69 @@ def validate_todos_against_task(
         errors=errors,
         warnings=warnings,
     )
+
+# --- light validator override -------------------------------------------------
+# The original validator above was intentionally strict, but it over-constrained
+# early task planning and caused the lead to loop on wording. This final
+# definition overrides it with a lighter generic validator: todo plans must be
+# non-empty, concrete enough, and cover the task direction, but they do not need
+# to repeat every filename in every verification step.
+def validate_todos_against_task(
+    *,
+    subject: str,
+    description: str = "",
+    todos: list[dict],
+    strict: bool = True,
+) -> ValidationResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not isinstance(todos, list) or not todos:
+        return ValidationResult(ok=False, errors=["Todos are required."])
+
+    task_text = f"{subject or ''}\n{description or ''}"
+    task_files = extract_file_mentions(task_text)
+    todo_text = _todos_blob(todos)
+    todo_files = extract_file_mentions(todo_text)
+
+    missing_files = [
+        original
+        for normalized, original in {_norm(item): item for item in task_files}.items()
+        if normalized not in {_norm(item): item for item in todo_files}
+    ]
+    if missing_files:
+        warnings.append(
+            "Todos do not explicitly mention all file targets from the task subject/description: "
+            + _format_missing(missing_files)
+        )
+
+    if len(task_files) >= 2:
+        first_todo_text = _todo_blob(todos[0])
+        if not _contains_any(first_todo_text, TARGET_RESOLUTION_WORDS):
+            warnings.append("Multi-file tasks should start with a target-resolution todo.")
+
+    for index, todo in enumerate(todos):
+        content = str(todo.get("content", "")).strip()
+        active_form = str(todo.get("activeForm", "")).strip()
+        status = str(todo.get("status", "pending")).strip().casefold()
+        reason = str(todo.get("reason", "")).strip()
+        current_text = _todo_blob(todo)
+
+        if not content:
+            errors.append(f"Todo #{index}: content is required.")
+        elif len(content) < 20:
+            warnings.append(f"Todo #{index}: content is very short; include action and success criteria when possible.")
+
+        if not active_form:
+            warnings.append(f"Todo #{index}: activeForm is missing.")
+
+        if status not in {"pending", "in_progress", "completed", "failed", "blocked", "skipped"}:
+            errors.append(f"Todo #{index}: invalid status '{status}'.")
+
+        if status in {"blocked", "failed"} and not reason:
+            errors.append(f"Todo #{index}: reason is required when status is '{status}'.")
+
+        if _contains_any(current_text, VERIFICATION_WORDS) and not _contains_any(current_text, VERIFICATION_SUCCESS_WORDS):
+            warnings.append(f"Todo #{index}: verification-like todo should include explicit success/failure criteria.")
+
+    return ValidationResult(ok=not errors, errors=errors, warnings=warnings)

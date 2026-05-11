@@ -1,0 +1,502 @@
+可以，这个约束要总结成一个**通用产物验收流程**，不是只针对 `change_plan`。
+
+核心原则是：
+
+```text
+只要 task.conclusion_type 非空，这个 task 的最终结果就必须是结构化 artifact。
+artifact_type 必须等于 task.conclusion_type。
+校验失败是 request-level failure，不是自动 task failed。
+是否重派、失败、换方案，由 leader 决策。
+```
+
+你现在的 `TaskRecord` 已经有 `phase / conclusion_type / authorization`，其中 `conclusion_type` 正好表示该 task 的明确产物类型，`authorization` 则用于后续写权限 guard。
+
+---
+
+## 一、正常流程
+
+### Step 1：leader 创建 task graph
+
+leader 创建 task 时，如果这个 task 需要明确产物，就必须写：
+
+```json
+{
+  "phase": "proposal",
+  "conclusion_type": "change_plan"
+}
+```
+
+或者：
+
+```json
+{
+  "phase": "review_plan",
+  "conclusion_type": "review_result"
+}
+```
+
+也就是说：
+
+```text
+conclusion_type 不是提示词。
+conclusion_type 是协议字段。
+```
+
+它决定 teammate 最终必须输出什么 artifact。
+
+---
+
+### Step 2：leader dispatch task_request
+
+leader 派发 task 时，消息类型仍然是：
+
+```text
+msg_type = task_request
+```
+
+dispatch 内容里的 `<task-context>` 应该带上：
+
+```json
+{
+  "task_id": 1,
+  "phase": "proposal",
+  "conclusion_type": "change_plan",
+  "authorization": {},
+  "todos": []
+}
+```
+
+你当前 dispatch 逻辑已经会把 task 分配给 teammate，并把 task 置为 `in_progress`；同一个 task 已经分配后默认不允许重复派发，除非 `allow_retry=true`。
+
+---
+
+### Step 3：teammate 执行 task
+
+teammate 按 task 的 `phase` 和 `todos` 执行。
+
+如果 `conclusion_type` 为空：
+
+```text
+允许普通自然语言 task_result。
+```
+
+如果 `conclusion_type` 非空：
+
+```text
+最终 response 必须是 JSON artifact。
+artifact_type 必须等于 conclusion_type。
+```
+
+例如：
+
+```json
+{
+  "artifact_type": "change_plan",
+  "artifact_version": "v1",
+  "producer": "engineer",
+  "task_id": 1,
+  "summary": "...",
+  "goal": "...",
+  "target_files": [],
+  "mutation_strategy": {
+    "mode": "copy_new",
+    "reason": "..."
+  },
+  "approach": [],
+  "validation_plan": [],
+  "rollback_plan": []
+}
+```
+
+---
+
+### Step 4：teammate 发回结果
+
+不同角色可以有不同 `msg_type`：
+
+```text
+engineer      -> task_result
+reviewer      -> review_result
+experiment    -> experiment_result
+```
+
+但真正决定内容是否合法的，不是 `msg_type`，而是：
+
+```text
+task.conclusion_type == artifact.artifact_type
+```
+
+也就是说：
+
+```text
+msg_type 管消息类型。
+conclusion_type 管要求产物。
+artifact_type 管实际产物。
+```
+
+---
+
+### Step 5：lead inbox sync 做 request-level 校验
+
+lead 收到 teammate 消息后，根据 `task_id` 找 task：
+
+```text
+task = TASK_MANAGER.get(task_id)
+expected = task.conclusion_type
+```
+
+然后判断：
+
+```text
+expected 为空：
+  兼容旧流程，普通 task_result 可以 complete_request。
+
+expected 非空：
+  content 必须是 JSON object。
+  artifact_type 必须等于 expected。
+  调用 artifact_validator。
+```
+
+如果通过：
+
+```text
+RequestStore.complete_request(request_id, result=artifact)
+```
+
+artifact 落在：
+
+```text
+.team/requests.json 的 request.result
+```
+
+如果不通过：
+
+```text
+RequestStore.fail_request(request_id, reason=validator_error)
+```
+
+注意：这里**只改 request 状态**，不直接改 task 状态。
+
+---
+
+## 二、校验失败后的流程
+
+### Step 6：artifact validation failure
+
+比如 engineer 返回了自然语言，但 task 要求：
+
+```json
+{
+  "conclusion_type": "change_plan"
+}
+```
+
+这时 lead sync 应该做：
+
+```text
+RequestStore.fail_request(req_A, reason="Task requires artifact_type=change_plan, but response is not valid JSON.")
+```
+
+此时：
+
+```text
+request = failed
+task    = 仍然 in_progress
+```
+
+这很重要。
+因为 request 失败只说明**这一次派发失败**，不代表 task 自动失败。
+
+task 的 active 状态包括 `pending / in_progress / blocked`，终态是 `completed / failed / deleted`；所以如果 request 失败后 leader 不处理，task 会继续处在 active 图里。
+
+---
+
+### Step 7：leader 做收束决策
+
+leader 读取 failed request 后，有三个选择：
+
+```text
+1. 重派同一个 task，要求补交合法 artifact
+2. 标记 task failed
+3. 创建新的修正 task / 缩小 scope / 问用户
+```
+
+这里不能由 `sync_requests_from_lead_inbox()` 自动决定。
+
+原因是 artifact 校验失败可能有不同性质：
+
+```text
+格式错误：
+  可以重派一次，要求按 schema 输出。
+
+内容不合格：
+  可能需要 request_changes 或重新拆任务。
+
+多次失败：
+  应该倾向 task_set_status(failed)，避免无限循环。
+```
+
+---
+
+## 三、重派流程
+
+### Step 8：leader 显式 retry
+
+如果 leader 判断这是协议格式问题，可以重派：
+
+```json
+{
+  "to": "engineer",
+  "task_id": 1,
+  "allow_retry": true,
+  "content": "Your previous result failed artifact validation..."
+}
+```
+
+这里必须用：
+
+```text
+allow_retry=true
+```
+
+因为当前 dispatch 逻辑已经有保护：如果 task 已经分配给同一个 teammate 且状态是 `in_progress / blocked / failed`，默认拒绝重复派发，除非显式 retry。
+
+---
+
+### Step 9：重派内容必须带 validator error
+
+重派消息不能只说“重新输出一下”。
+
+应该明确给 teammate：
+
+```text
+Your previous response failed the required artifact validation.
+
+Task requirement:
+- task_id: 1
+- phase: proposal
+- conclusion_type: change_plan
+- final msg_type: task_result
+- final content must be a JSON artifact
+- artifact_type must equal change_plan
+
+Validation error:
+<validator error>
+
+Retry requirement:
+Return only a valid change_plan JSON artifact as the final task_result.
+Do not return a natural-language final result.
+```
+
+这次重派的目标不是重新理解任务，而是：
+
+```text
+修正协议产物输出。
+```
+
+---
+
+### Step 10：重派后的结果再次校验
+
+teammate 第二次返回后，走完全相同的验收链路：
+
+```text
+message -> task_id -> conclusion_type -> JSON parse -> artifact_type check -> validator
+```
+
+如果通过：
+
+```text
+RequestStore.complete_request(request_id, result=artifact)
+```
+
+然后 leader 才能考虑：
+
+```text
+task_set_status(task_id, completed)
+```
+
+如果仍失败：
+
+```text
+RequestStore.fail_request(...)
+```
+
+leader 应该倾向：
+
+```text
+task_set_status(task_id, failed, reason="Repeatedly failed to produce required artifact...")
+```
+
+或者重新拆 task，而不是无限 retry。
+
+---
+
+## 四、完整闭环一句话版
+
+```text
+leader 用 task.conclusion_type 声明产物要求；
+dispatch 时把 phase/conclusion_type 传给 teammate；
+teammate 最终必须返回 artifact_type 匹配 conclusion_type 的 JSON artifact；
+lead inbox sync 用 artifact_validator 校验；
+校验通过才 complete_request，并把 artifact 存入 RequestStore.result；
+校验失败只 fail_request，不自动 fail task；
+leader 根据 failed request 决定是否 allow_retry=true 重派；
+重派必须带 validator error 和 required artifact schema；
+再次失败则由 leader 决定 task failed / 重新拆 task / 询问用户。
+```
+
+---
+
+## 五、要写进 skill 的规则
+
+可以直接写成：
+
+```text
+Artifact output rule:
+
+Any task with non-empty conclusion_type requires a structured JSON artifact as the final response.
+
+Rules:
+1. artifact_type must exactly equal task.conclusion_type.
+2. Natural-language final responses are only allowed when conclusion_type is empty.
+3. The artifact is stored in RequestStore.result after validation.
+4. Artifact validation failure fails the request, not the task.
+5. Leader may retry the same task with allow_retry=true when the failure is a protocol/artifact formatting issue.
+6. Retry dispatch must include the validator error and required artifact schema.
+7. Do not retry indefinitely. Repeated artifact validation failure should be resolved by task_set_status(failed), a new corrective task, or user clarification.
+```
+
+
+
+这个流程可以统一约束所有产物，不只是 `change_plan`，后面 `review_result / implementation_result / validation_result` 都复用同一套。
+
+skill 应该怎么拆
+
+我建议不要做一个巨大的 skill。拆成 3 个最合适。
+
+1. team_collaboration.md
+
+放团队协作协议。
+
+内容包括：
+
+- 四层协议：Task Graph / Request / Message Type / Artifact
+- teammate 不直接传关键产物，全部回 lead
+- 每个 task = 一个 owner + 一个明确 conclusion
+- reviewer 只评 lead 转交的 source_artifact
+- review_result 只完成 request，不授权 write
+- WRITE_APPROVED 只能由 leader 发
+- artifact validation failed 后如何 allow_retry=true 重派
+
+这个 skill 是最大的，也是 leader 创建多成员任务时必须加载的。
+
+2. task_graph.md
+
+放 task 拆分和状态边界。
+
+内容包括：
+
+- 不固定 task 数量
+- task graph 表达“谁的结论阻塞下一步”
+- 一个 task 必须有一个明确 owner
+- 如果需要明确产物，必须设置 conclusion_type
+- task.status 只表达生命周期：pending / in_progress / blocked / completed / failed / deleted
+- task failed 后如何收束 todo
+- completed 只能在 todo resolved 后设置
+
+这里要和你现在 TaskRecord 对齐。当前 task 已经有 phase / conclusion_type / authorization，这些字段就是协作协议元信息：phase 描述 task 在协作链路中的角色，conclusion_type 描述明确产物，authorization 给后续 runtime guard 使用。
+
+3. todo_contract.md
+
+放 todo 规则。
+
+内容包括：
+
+- todo 必须可执行、可验证、低歧义
+- 多文件任务必须先做 target resolution
+- 每个 target file 必须被 todo 覆盖
+- todo failed / blocked 必须有 reason
+- teammate 只能更新自己 task 内的 todo
+- task completed 前所有 todo 必须 completed / skipped
+
+这个可以和现有 task_plan_validator.py 配合。你之前测试里已经证明 todo validator 能拦错误计划，所以这部分适合继续沉淀成 skill + validator 双层。
+
+prompt 里应该怎么提
+
+prompt 不应该塞完整规则，太长，也容易变旧。
+prompt 里只要写“触发条件 + 必须加载 skill”。
+
+可以加类似这段：
+
+When planning or executing multi-teammate work, load and follow team_collaboration.
+
+When creating or modifying persistent tasks, load and follow task_graph.
+
+When setting task todos, load and follow todo_contract.
+
+If a task has non-empty conclusion_type, its final result must be a structured artifact whose artifact_type exactly matches conclusion_type. Natural-language final responses are only allowed when conclusion_type is empty.
+
+中文意思就是：
+
+涉及多成员协作时，必须加载 team_collaboration；
+创建或修改 task graph 时，必须加载 task_graph；
+设置 todos 时，必须加载 todo_contract；
+conclusion_type 非空的 task，最终必须输出匹配 artifact。
+
+这段放在 leader prompt 就够了。
+
+teammate prompt 也要有短规则
+
+你现在 teammate system prompt 里已经有协议规则：tracked request、<task-context>、todo_update、最终 task_result、不能给 tracked request 用普通 message 等。
+
+这里建议补一段短规则：
+
+If the <task-context> has a non-empty conclusion_type, your final response must be a JSON artifact with artifact_type equal to conclusion_type. Do not send a natural-language final response for such tasks.
+
+但是注意：你当前 _build_dispatch_content() 还没有把 phase / conclusion_type / authorization 放进 <task-context>，现在只带了 task_id / subject / workspace / cwd / allowed_roots / todos。
+所以要让 teammate 真的遵守这个规则，后续第五步 dispatch 增强必须做。
+
+skill 和代码约束怎么分工
+
+最终应该是这样：
+
+skill:
+  告诉模型应该怎么做。
+
+validator / runtime:
+  防止模型没做到。
+
+prompt:
+  告诉模型什么时候加载 skill。
+
+memory:
+  最多记录“以 repo skill 为准”，不记录完整协议。
+
+也就是说：
+
+skill 是规范正文；
+prompt 是入口提示；
+validator 是兜底执行；
+memory 不是协议来源。
+我建议的落地顺序
+
+下一步不要先改 memory。建议：
+
+1. 新建 skill/team_collaboration.md
+2. 新建 skill/task_graph.md
+3. 新建 skill/todo_contract.md
+4. 在 build_prompt.py 的 leader prompt 里加入短触发规则
+5. 在 teammate_manager.py 的 teammate prompt 里加入 conclusion_type artifact 输出规则
+6. 后续 dispatch 增强时，把 phase / conclusion_type / authorization 放入 <task-context>
+
+其中第 6 点很关键，因为 task 里虽然已经持久化了 phase / conclusion_type / authorization，但 dispatch 时还没传给 teammate；如果不传，prompt 规则会缺上下文。
+
+最终建议
+
+不要把这些完整协议设置成 memory。
+应该做成 repo 内 skill，并在 prompt 里明确：
+
+这些 skill 是 team/task/todo/artifact 协作的 source of truth。
+
+memory 只适合放一句轻量提醒，不适合承载协议正文。

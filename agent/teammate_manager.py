@@ -72,7 +72,9 @@ class TeammateManager:
         self.threads: dict[str, threading.Thread] = {}
         self.active_request_ids: dict[str, str] = {}
         self._active_task_ids: dict[str, int] = {}
+        self._active_task_contexts: dict[str, dict] = {}
         self._active_todo_indexes: dict[str, int] = {}
+        self._finalize_prompt_sent: set[str] = set()
         self._forced_tool_actions: dict[str, list[dict]] = {}
 
     # ------------------------------------------------------------------
@@ -284,12 +286,16 @@ class TeammateManager:
         defaults = [
             {
                 "name": "engineer",
-                "role": "migration engineer",
+                "role": "code engineer",
                 "tool_profile": "engineer",
                 "instructions": (
-                    "Specialize in reading target repositories, external repositories, "
-                    "papers, model code, architecture files, and migration points. "
-                    "Produce practical migration plans and implementation guidance."
+                    "Directly responsible for all code-related work: repository inspection, "
+                    "model architecture analysis, migration planning, change_plan artifacts, "
+                    "and implementation after lead issues WRITE_APPROVED. "
+                    "If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; "
+                    "do not finish with natural language or manually composed JSON. "
+                    "Do not write code unless the task phase and authorization allow it. "
+                    "Do not decide task status."
                 ),
             },
             {
@@ -297,17 +303,21 @@ class TeammateManager:
                 "role": "technical reviewer",
                 "tool_profile": "reviewer",
                 "instructions": (
-                    "Review migration plans, architecture analysis, code-change proposals, "
-                    "and experiment results. Return approve, needs_changes, or reject with reasons."
+                    "Independently review source_artifacts forwarded by lead, including change_plan "
+                    "artifacts and implementation results. Submit review_result with decision=approve, "
+                    "request_changes, or reject. Do not write code, do not authorize writes, and do not "
+                    "decide task status."
                 ),
             },
             {
                 "name": "experiment_runner",
-                "role": "experiment runner",
+                "role": "validation executor",
                 "tool_profile": "experiment_runner",
                 "instructions": (
-                    "Prepare, run, or summarize tests and experiments. Report commands, "
-                    "status, logs, metrics, and failure reasons."
+                    "Run or summarize validation work assigned by lead, including tests, training smoke tests, "
+                    "model build checks, command verification, logs, metrics, and failure reasons. "
+                    "If task.conclusion_type=validation_result, submit a valid validation_result artifact. "
+                    "Do not change source files unless explicitly authorized by lead."
                 ),
             },
         ]
@@ -444,6 +454,25 @@ class TeammateManager:
     # Teammate loop
     # ------------------------------------------------------------------
 
+
+    def _is_active_change_plan_task(self, actor: str) -> bool:
+        ctx = self._active_task_contexts.get(actor, {}) or {}
+        return str(ctx.get("conclusion_type", "")).strip() == "change_plan"
+
+    def _build_change_plan_finalize_prompt(self, actor: str) -> str:
+        ctx = self._active_task_contexts.get(actor, {}) or {}
+        subject = str(ctx.get("subject", "the assigned proposal task"))
+        return (
+            "<system-reminder>\n"
+            f"You are working on a tracked change_plan task: {subject}.\n"
+            "You have already gathered evidence or reached the recovery limit. Stop collecting more context.\n"
+            "Your next action MUST be exactly one of:\n"
+            "1. Call submit_change_plan with the best plan you can produce from the evidence already gathered.\n"
+            "2. Call send_message with msg_type=error and a concise blocking reason.\n"
+            "Do not call scan_yolo_project, read_file, read_code, run_shell, run_python, or todo_update again before choosing one of those final actions.\n"
+            "</system-reminder>"
+        )
+
     def _teammate_loop(self, name: str) -> None:
         member = self._find_member(name)
         if member is None:
@@ -547,11 +576,22 @@ class TeammateManager:
                     break
 
                 if "exhausted" in runner_result.stop_reason or runner_result.stop_reason in ("empty_response",):
+                    # change_plan proposal tasks often fail at the finalization boundary: the model keeps
+                    # reading/scanning but never submits the artifact. Give it one forced finalization turn.
+                    if self._is_active_change_plan_task(name) and name not in self._finalize_prompt_sent:
+                        self._finalize_prompt_sent.add(name)
+                        messages.append({
+                            "role": "user",
+                            "content": self._build_change_plan_finalize_prompt(name),
+                        })
+                        continue
+
                     self.bus.send(
                         sender=name,
                         to="lead",
                         content=f"Teammate loop stopped: {runner_result.stop_reason}",
                         msg_type="error",
+                        extra=self._request_extra_for(name),
                     )
                     break
 
@@ -568,6 +608,8 @@ class TeammateManager:
 
             self.active_request_ids.pop(name, None)
             self._active_task_ids.pop(name, None)
+            self._active_task_contexts.pop(name, None)
+            self._finalize_prompt_sent.discard(name)
             self._active_todo_indexes.pop(name, None)
             self._forced_tool_actions.pop(name, None)
 
@@ -873,6 +915,7 @@ class TeammateManager:
                 task_id = ctx.get("task_id")
                 if task_id is not None:
                     self._active_task_ids[actor] = int(task_id)
+                    self._active_task_contexts[actor] = ctx
                 if workspace:
                     from tools.yolo_tools import set_yolo_workspace
                     set_yolo_workspace(workspace)

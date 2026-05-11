@@ -12,6 +12,8 @@ Key insight: "The loop didn't change at all. I just added tools."
 from pathlib import Path
 import time
 import json
+import random
+import threading
 from agent.skillRegistry import SkillRegistry
 from agent.subagent import run_subagent
 from agent.state import WORKDIR, WORKSPACE_ROOT, TODO_STATE
@@ -109,8 +111,9 @@ TASKS_DIR = WORKSPACE_ROOT / ".tasks"
 TASK_MANAGER = TaskManager(TASKS_DIR)
 PROJECT_ROOT = WORKSPACE_ROOT
 SKILL_REGISTRY = SkillRegistry(Path(PROJECT_ROOT / "skill"))
-MODEL_REQUEST_RETRIES = 3
+MODEL_REQUEST_RETRIES = 4
 MODEL_RETRY_DELAY_SECONDS = 2
+MODEL_CALL_LOCK = threading.Lock()
 TEAM_DIR = WORKSPACE_ROOT / ".team"
 TEAM_INBOX_DIR = TEAM_DIR / "inbox"
 TEAM_REQUESTS_FILE = TEAM_DIR / "requests.json"
@@ -314,6 +317,19 @@ def auto_compact_for_recovery(messages: list) -> list:
     compacted_messages, _changed = micro_compact_messages(messages)
     return compacted_messages
 
+def _handle_task_set_todos(kw: dict) -> str:
+    task_id = kw.get("task_id", kw.get("id"))
+    if task_id is None:
+        return "Error: task_set_todos requires task_id. Use task_id, not id."
+    try:
+        return json.dumps(
+            TASK_MANAGER.set_todos(int(task_id), kw["todos"]),
+            ensure_ascii=False,
+            indent=2,
+        )
+    except ValueError as e:
+        return f"Error: {e}"
+
 TOOL_HANDLERS = {
     "run_shell":  lambda **kw: run_bash(kw["command"]),
     "run_python": lambda **kw: run_python(kw["code"]),
@@ -358,10 +374,7 @@ TOOL_HANDLERS = {
         TASK_MANAGER.set_workspace(kw["task_id"], kw["path"]),
         ensure_ascii=False, indent=2,
     ),
-    "task_set_todos": lambda **kw: json.dumps(
-        TASK_MANAGER.set_todos(kw["task_id"], kw["todos"]),
-        ensure_ascii=False, indent=2,
-    ),
+    "task_set_todos": lambda **kw: _handle_task_set_todos(kw),
     "background_run": lambda **kw: BACKGROUND_MANAGER.run(
         kw["command"],
         kw.get("timeout", 300),
@@ -407,6 +420,14 @@ TOOL_HANDLERS = {
     ),
     "request_get": lambda **kw: json.dumps(
         REQUEST_STORE.get_request(kw["request_id"]),
+        ensure_ascii=False,
+        indent=2,
+    ),
+    "request_cancel": lambda **kw: json.dumps(
+        REQUEST_STORE.cancel_request(
+            request_id=kw["request_id"],
+            reason=kw.get("reason", "Request cancelled by lead."),
+        ),
         ensure_ascii=False,
         indent=2,
     ),
@@ -948,6 +969,18 @@ TOOLS = [
         "required": ["request_id"],
     },
 },
+{
+    "name": "request_cancel",
+    "description": "Cancel one open tracked request before retrying or changing direction.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["request_id", "reason"],
+    },
+},
 ] 
 PROMPT_BUILDER = SystemPromptBuilder(
     workdir=Path(WORKDIR),
@@ -957,26 +990,46 @@ PROMPT_BUILDER = SystemPromptBuilder(
     memory_store=memory_store,
 )
 
+def _is_retryable_model_error(e: Exception) -> bool:
+    status_code = getattr(e, "status_code", None)
+    name = e.__class__.__name__
+    return status_code in {429, 500, 502, 503, 504} or name in {"RateLimitError", "InternalServerError"}
+
+
+def _retry_delay_for_model_error(e: Exception, attempt: int) -> float:
+    headers = getattr(e, "headers", {}) or {}
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except Exception:
+            pass
+    status_code = getattr(e, "status_code", None)
+    name = e.__class__.__name__
+    if status_code == 429 or name == "RateLimitError":
+        return min(75.0, 20.0 * attempt + random.uniform(0.0, 3.0))
+    return min(30.0, MODEL_RETRY_DELAY_SECONDS * attempt + random.uniform(0.0, 1.0))
+
+
 def create_model_response(*, system: str, messages: list, tools: list, max_tokens: int):
     last_error = None
 
     for attempt in range(1, MODEL_REQUEST_RETRIES + 1):
         try:
-            return client.messages.create(
-                model=MODEL,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=max_tokens,
-            )
+            with MODEL_CALL_LOCK:
+                return client.messages.create(
+                    model=MODEL,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                )
         except Exception as e:
             status_code = getattr(e, "status_code", None)
-            is_internal_server_error = (
-                status_code == 500
-                or e.__class__.__name__ == "InternalServerError"
-            )
+            body = getattr(e, "body", None) or getattr(e, "message", "") or str(e)[:500]
+            print(f"[API error] status={status_code} type={e.__class__.__name__} body={body}")
 
-            if not is_internal_server_error:
+            if not _is_retryable_model_error(e):
                 raise
 
             last_error = e
@@ -984,16 +1037,17 @@ def create_model_response(*, system: str, messages: list, tools: list, max_token
                 print(f"Model request failed after {attempt} attempts: {e}")
                 return None
 
-            delay = MODEL_RETRY_DELAY_SECONDS * attempt
+            delay = _retry_delay_for_model_error(e, attempt)
             print(
-                f"Model request failed with 500, retrying in {delay}s "
-                f"({attempt}/{MODEL_REQUEST_RETRIES})"
+                f"[Model retry] status={status_code} type={e.__class__.__name__}; "
+                f"sleep {delay:.1f}s ({attempt}/{MODEL_REQUEST_RETRIES})"
             )
             time.sleep(delay)
 
     if last_error:
         print(f"Model request failed: {last_error}")
     return None
+
 
 def lead_after_tool_batch(executions, tool_results):
     used_todo = any(execution.tool_name == "todo" for execution in executions)
@@ -1236,7 +1290,7 @@ def agent_loop(messages: list):
                 apply_backoff_recovery_fn=apply_backoff_recovery,
                 compact_fn=auto_compact_for_recovery,
 
-                max_tokens=8000,
+                max_tokens=2500,
                 prompt_dirty_fn=maybe_mark_prompt_dirty,
                 log_fn=print,
                 after_tool_batch_fn=lead_after_tool_batch,
