@@ -76,6 +76,7 @@ class TeammateManager:
         self._active_todo_indexes: dict[str, int] = {}
         self._finalize_prompt_sent: set[str] = set()
         self._forced_tool_actions: dict[str, list[dict]] = {}
+        self._paused_for_lead: set[str] = set()
 
     # ------------------------------------------------------------------
     # Team registry
@@ -91,17 +92,23 @@ class TeammateManager:
 
     def _report_tool_errors(self, name: str, executions) -> None:
         """
-        把工具错误报告给 lead。
+        把普通工具错误报告给 lead，并暂停 teammate 等待 lead 指令。
 
         注意：
-        - write_file/edit_file 这类 mutating file failure 会由 forced failure finalization
-          统一执行 todo_update(failed) + send_message(error)。
-        - 这里跳过它们，避免 lead 收到两条重复 error。
+        - write_file/edit_file 这类 mutating file failure 已经由 forced failure finalization 处理；
+        - todo_update 这类状态同步失败由 _should_stop_after_teammate_tools 处理；
+        - 其他工具错误只报告一次，然后暂停，不让 teammate 自己继续乱 retry。
         """
         payload = []
 
         for execution in executions:
             if self._is_mutating_file_failure(execution):
+                continue
+
+            if self._is_state_sync_failure(execution):
+                continue
+
+            if execution.status == "executed":
                 continue
 
             payload.append(
@@ -123,6 +130,9 @@ class TeammateManager:
             extra=self._request_extra_for(name),
         )
 
+        # 关键：工具错误后暂停，不继续自我恢复/重试。
+        self._paused_for_lead.add(name)
+
     def _send_text_response_to_lead(self, name: str, member: dict, text: str) -> None:
         self.bus.send(
             sender=name,
@@ -134,6 +144,18 @@ class TeammateManager:
 
     STATE_SYNC_TOOLS = {"todo_update"}
     MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
+
+    SUBMIT_ARTIFACT_TOOLS = {
+        "submit_change_plan": "change_plan",
+        "submit_review_result": "review_result",
+        "submit_validation_result": "validation_result",
+        "submit_implementation_result": "implementation_result",
+    }
+
+    FINALIZING_TOOLS = {
+        "send_message",
+        *SUBMIT_ARTIFACT_TOOLS.keys(),
+    }
 
     def _is_state_sync_failure(self, execution) -> bool:
         return (
@@ -147,23 +169,29 @@ class TeammateManager:
                 and execution.status != "executed"
         )
 
-
+    def _is_generic_tool_failure(self, execution) -> bool:
+        return (
+                execution.status != "executed"
+                and execution.tool_name not in self.STATE_SYNC_TOOLS
+                and not self._is_mutating_file_failure(execution)
+        )
 
     def _should_stop_after_teammate_tools(self, actor: str, executions) -> bool:
         for execution in executions:
-            if execution.tool_name == "send_message" and execution.status == "executed":
+            if execution.tool_name in self.FINALIZING_TOOLS and execution.status == "executed":
                 return True
 
             if self._is_state_sync_failure(execution):
                 self._send_teammate_error(
                     actor,
                     (
-                        "Teammate stopped after state-sync tool failure. "
+                        "Teammate paused after state-sync tool failure. "
                         f"tool={execution.tool_name}, status={execution.status}, reason={execution.reason}"
                     ),
                 )
+                self._paused_for_lead.add(actor)
                 print(
-                    "Stopping after state-sync failure: "
+                    "Pausing after state-sync failure: "
                     f"{execution.tool_name} status={execution.status} reason={execution.reason}"
                 )
                 return True
@@ -172,6 +200,14 @@ class TeammateManager:
                 self._schedule_forced_failure_finalization(actor, execution)
                 print(
                     "Scheduling forced failure finalization after mutating file tool failure: "
+                    f"{execution.tool_name} status={execution.status} reason={execution.reason}"
+                )
+                return True
+
+            if self._is_generic_tool_failure(execution):
+                self._paused_for_lead.add(actor)
+                print(
+                    "Pausing teammate after generic tool failure: "
                     f"{execution.tool_name} status={execution.status} reason={execution.reason}"
                 )
                 return True
@@ -292,7 +328,7 @@ class TeammateManager:
                     "Directly responsible for all code-related work: repository inspection, "
                     "model architecture analysis, migration planning, change_plan artifacts, "
                     "and implementation after lead issues WRITE_APPROVED. "
-                    "If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; "
+                    "If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; If task.conclusion_type=implementation_result, the final action MUST be submit_implementation_result."
                     "do not finish with natural language or manually composed JSON. "
                     "Do not write code unless the task phase and authorization allow it. "
                     "Do not decide task status."
@@ -304,9 +340,9 @@ class TeammateManager:
                 "tool_profile": "reviewer",
                 "instructions": (
                     "Independently review source_artifacts forwarded by lead, including change_plan "
-                    "artifacts and implementation results. Submit review_result with decision=approve, "
-                    "request_changes, or reject. Do not write code, do not authorize writes, and do not "
-                    "decide task status."
+                    "artifacts and implementation results. If task.conclusion_type=review_result, "
+                    "the final action MUST be submit_review_result with decision=approve, "
+                    "request_changes, or reject. Do not write code, do not authorize writes, and do not decide task status"
                 ),
             },
             {
@@ -316,7 +352,8 @@ class TeammateManager:
                 "instructions": (
                     "Run or summarize validation work assigned by lead, including tests, training smoke tests, "
                     "model build checks, command verification, logs, metrics, and failure reasons. "
-                    "If task.conclusion_type=validation_result, submit a valid validation_result artifact. "
+                    "If task.conclusion_type=validation_result, the final action MUST be "
+                    "submit_validation_result with a valid validation_result artifact. "
                     "Do not change source files unless explicitly authorized by lead."
                 ),
             },
@@ -491,8 +528,19 @@ class TeammateManager:
 
                 inbox = self.bus.read_inbox(name)
 
+                # 没有任何历史消息，也没有新消息，说明线程可以结束。
                 if not inbox and not messages:
                     break
+
+                # 如果已经因工具错误暂停，且 lead 还没给新指令，则不要继续 runner。
+                # 保留 messages 和 active request/task 上下文，短暂睡眠后继续检查 inbox。
+                if not inbox and name in self._paused_for_lead:
+                    time.sleep(0.5)
+                    continue
+
+                # 只要 lead 发来新消息，就解除暂停，把新消息 append 到 messages 后再继续。
+                if inbox and name in self._paused_for_lead:
+                    self._paused_for_lead.discard(name)
 
                 for message in inbox:
                     request_id = message.get("request_id")
@@ -568,6 +616,12 @@ class TeammateManager:
                 self._drain_forced_tool_actions(name, member)
 
                 if runner_result.stop_reason in ("stopped_after_tool",):
+                    # 如果是因为普通工具错误进入 paused_for_lead，
+                    # 不退出线程，保留 messages / active request / active task，
+                    # 回到 while 顶部等待 lead 新消息。
+                    if name in self._paused_for_lead:
+                        continue
+
                     break
 
                 # teammate 如果直接自然语言回复，AgentRunner 已经通过 on_text_response_fn
@@ -604,14 +658,22 @@ class TeammateManager:
             )
 
 
+
         finally:
 
             self.active_request_ids.pop(name, None)
+
             self._active_task_ids.pop(name, None)
+
             self._active_task_contexts.pop(name, None)
+
             self._finalize_prompt_sent.discard(name)
+
             self._active_todo_indexes.pop(name, None)
+
             self._forced_tool_actions.pop(name, None)
+
+            self._paused_for_lead.discard(name)
 
             member = self._find_member(name)
 
@@ -635,6 +697,7 @@ class TeammateManager:
         def wrapped(sender: str, **kw) -> str:
             output = handler(sender, **kw)
 
+            # 1. 记录当前 in_progress todo，便于 submit_* 成功后自动收束。
             if tool_name == "todo_update":
                 try:
                     index = int(kw["index"])
@@ -650,9 +713,163 @@ class TeammateManager:
                 except Exception:
                     pass
 
+            # 2. submit_* 成功后，自动把当前 final todo 标记为 completed。
+            # 注意：send_message 不在这里自动完成，因为 send_message 可能只是中途提问或报错。
+            if tool_name in self.SUBMIT_ARTIFACT_TOOLS:
+                text_output = str(output or "")
+                if not text_output.lstrip().startswith("Error:"):
+                    artifact_type = self.SUBMIT_ARTIFACT_TOOLS[tool_name]
+                    self._complete_active_final_todo_after_submit(
+                        actor=sender,
+                        member=member,
+                        artifact_type=artifact_type,
+                    )
+
             return output
 
         return wrapped
+
+    def _complete_active_final_todo_after_submit(
+            self,
+            *,
+            actor: str,
+            member: dict,
+            artifact_type: str,
+    ) -> None:
+        """
+        submit_* 成功后，自动完成当前 final todo。
+
+        为什么需要：
+        - 模型经常已经 submit_review_result / submit_change_plan 成功；
+        - 但忘记把最后一个 “Produce/Submit xxx artifact” todo 标 completed；
+        - lead 后续 task_set_status(completed) 会被 todo guard 拦住。
+
+        设计边界：
+        - 只在 submit_* 成功后执行；
+        - 不处理 send_message；
+        - 优先完成当前 in_progress todo；
+        - 如果没有 active todo，则从 task-context 的 todos 里倒序查找包含 artifact_type 的 final todo。
+        """
+        task_id = self._active_task_ids.get(actor)
+        if task_id is None:
+            return
+
+        todo_index = self._find_final_todo_index_for_artifact(
+            actor=actor,
+            artifact_type=artifact_type,
+        )
+
+        if todo_index is None:
+            return
+
+        try:
+            output = self._exec_tool_for_member(
+                member,
+                "todo_update",
+                {
+                    "index": todo_index,
+                    "status": "completed",
+                    "reason": f"Auto-completed after successful submit of {artifact_type}.",
+                },
+            )
+
+            if str(output).lstrip().startswith("Error:"):
+                self._send_teammate_error(
+                    actor,
+                    (
+                        "Auto-complete final todo after submit failed. "
+                        f"artifact_type={artifact_type}, todo_index={todo_index}, output={output}"
+                    ),
+                )
+                return
+
+            if self._active_todo_indexes.get(actor) == todo_index:
+                self._active_todo_indexes.pop(actor, None)
+
+            print(
+                f"[{actor}] auto todo_update: completed final todo "
+                f"#{todo_index} after submit {artifact_type}"
+            )
+
+        except Exception as e:
+            self._send_teammate_error(
+                actor,
+                (
+                    "Auto-complete final todo after submit raised an exception. "
+                    f"artifact_type={artifact_type}, todo_index={todo_index}, error={e}"
+                ),
+            )
+
+    def _find_final_todo_index_for_artifact(
+            self,
+            *,
+            actor: str,
+            artifact_type: str,
+    ) -> int | None:
+        """
+        找到 submit_* 对应的 final todo index。
+
+        优先级：
+        1. 当前 active in_progress todo，如果它看起来就是 artifact final todo；
+        2. 从 task-context.todos 倒序找包含 artifact_type 的 todo；
+        3. 倒序找包含 submit/produce/writing/artifact/final 的 todo；
+        4. 兜底使用当前 active todo。
+        """
+        ctx = self._active_task_contexts.get(actor, {}) or {}
+        todos = ctx.get("todos") or []
+
+        normalized_artifact = str(artifact_type or "").strip().lower()
+        normalized_words = normalized_artifact.replace("_", " ")
+
+        def todo_text(index: int) -> str:
+            if index < 0 or index >= len(todos):
+                return ""
+
+            todo = todos[index]
+            if not isinstance(todo, dict):
+                return ""
+
+            return (
+                f"{todo.get('content', '')}\n"
+                f"{todo.get('activeForm', '')}\n"
+                f"{todo.get('status', '')}"
+            ).lower()
+
+        active_index = self._active_todo_indexes.get(actor)
+
+        # 1. 当前 active todo 如果像 final artifact todo，就优先使用它。
+        if active_index is not None:
+            text = todo_text(active_index)
+            if (
+                    normalized_artifact in text
+                    or normalized_words in text
+                    or "artifact" in text
+                    or "submit" in text
+                    or "produce" in text
+                    or "writing" in text
+            ):
+                return active_index
+
+        # 2. 倒序找明确包含 artifact_type 的 todo。
+        for index in range(len(todos) - 1, -1, -1):
+            text = todo_text(index)
+            if normalized_artifact in text or normalized_words in text:
+                return index
+
+        # 3. 倒序找泛化 final artifact todo。
+        for index in range(len(todos) - 1, -1, -1):
+            text = todo_text(index)
+            if (
+                    "artifact" in text
+                    or "submit" in text
+                    or "produce" in text
+                    or "writing" in text
+                    or "final" in text
+            ):
+                return index
+
+        # 4. 最后兜底：当前 active todo。
+        return active_index
 
     def _handlers_for_member(self, member: dict) -> dict:
         profile_name = member.get("tool_profile", "")
@@ -663,8 +880,26 @@ class TeammateManager:
 
         handlers = dict(profile.handlers)
 
+        # send_message 是所有 teammate -> lead 消息的统一出口。
+        # 它会自动附加 request_id / task_id 等协议上下文。
         if "send_message" in handlers:
             handlers["send_message"] = self._build_send_message_handler(member)
+
+        # submit_* 是强类型 artifact 工具，但底层仍然必须走 send_message。
+        # 注意：artifact_type 放在 JSON content 内部；
+        # msg_type 必须使用 MessageBus 支持的结果类型，例如 task_result / review_result / experiment_result。
+        tool_names = {
+            str(tool.get("name", "")).strip()
+            for tool in profile.tools
+            if isinstance(tool, dict)
+        }
+
+        for tool_name, artifact_type in self.SUBMIT_ARTIFACT_TOOLS.items():
+            if tool_name in tool_names:
+                handlers[tool_name] = self._build_submit_artifact_handler(
+                    member=member,
+                    artifact_type=artifact_type,
+                )
 
         return {
             tool_name: self._wrap_handler_for_runtime_tracking(member, tool_name, handler)
@@ -694,6 +929,60 @@ class TeammateManager:
 
         return send_message
 
+    def _build_submit_artifact_handler(self, member: dict, artifact_type: str):
+        """
+        构造 submit_* artifact 工具的统一 handler。
+
+        关键边界：
+        1. artifact_type 是业务产物类型，写入 content JSON 内部。
+        2. msg_type 是 MessageBus 外层消息类型，不能使用 change_plan。
+        3. 发送链路复用 send_message，避免 request_id/task_id 丢失。
+        4. submit 工具 schema 是 {"artifact": {...}}，所以必须解包 kw["artifact"]。
+        """
+        send_message = self._build_send_message_handler(member)
+
+        def submit_artifact(sender: str, **kw) -> str:
+            # submit_change_plan / submit_review_result / submit_validation_result
+            # 的 schema 都是 {"artifact": {...}}，这里必须取内部 artifact。
+            raw_artifact = kw.get("artifact", {})
+
+            if not isinstance(raw_artifact, dict):
+                return "Error: artifact must be a JSON object."
+
+            artifact = dict(raw_artifact)
+
+            # artifact_type 是内部产物类型，不是 MessageBus msg_type。
+            artifact["artifact_type"] = artifact_type
+
+            # 常用元数据兜底补齐。
+            artifact.setdefault("artifact_version", "v1")
+            artifact.setdefault("producer", sender)
+
+            # 补入 request_id/task_id，便于 artifact 自身可追溯。
+            # 真正用于 RequestStore 同步的是 send_message 里的 extra。
+            extra = self._request_extra_for(sender)
+
+            request_id = extra.get("request_id")
+            if request_id:
+                artifact.setdefault("request_id", request_id)
+
+            task_id = extra.get("task_id")
+            if task_id is not None:
+                artifact.setdefault("task_id", task_id)
+
+            # 外层 msg_type 必须是角色默认结果类型：
+            # engineer -> task_result
+            # reviewer -> review_result
+            # experiment_runner -> experiment_result
+            msg_type = self._default_result_type(member)
+
+            return send_message(
+                sender,
+                content=json.dumps(artifact, ensure_ascii=False, indent=2),
+                msg_type=msg_type,
+            )
+
+        return submit_artifact
 
 
     def _drain_forced_tool_actions(self, actor: str, member: dict) -> None:
@@ -814,7 +1103,12 @@ class TeammateManager:
     - Messages with request_id are tracked protocol messages.
     - The dispatch message may contain a <task-context> block with a "todos" list. This is your work plan. Work through each todo item in order.
     - Use todo_update to mark each todo item: set in_progress before starting, then completed when finished. If a step cannot be done, set blocked or failed with a reason.
-    - If you complete ALL todos for the task, send the final answer to lead with msg_type=task_result. Sending task_result ends this work session.
+    - If task.conclusion_type is non-empty, your final successful response MUST use the matching submit tool, not free text:
+      * change_plan -> submit_change_plan({{"artifact": {{...}}}})
+      * review_result -> submit_review_result({{"artifact": {{...}}}})
+      * implementation_result -> submit_implementation_result({{"artifact": {{...}}}})
+      * validation_result -> submit_validation_result({{"artifact": {{...}}}})
+    - If task.conclusion_type is empty and you complete ALL todos for the task, send the final answer to lead with msg_type=task_result. Sending a final result ends this work session.
     - If you cannot complete a tracked assignment, send msg_type=error and include the failure reason.
     - Do not use msg_type=message for a tracked request final response.
     - Use msg_type=message only for ordinary non-tracked communication or to ask the lead a question mid-work.

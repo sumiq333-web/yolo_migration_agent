@@ -135,66 +135,290 @@ def todo_reminder() -> str | None:
         return None
     return "<reminder>Refresh your current plan before continuing.</reminder>"
 
+def _block_to_api_dict(block):
+    """把 Anthropic SDK block 或 dict block 转成 API 可接受的 dict。
+
+    关键点：
+    - Claude SDK 返回的 TextBlock / ToolUseBlock 不是 dict；旧逻辑会把它们过滤掉。
+    - tool_use 一旦被过滤，后续 tool_result 就会变成 orphan，API 会 400。
+    - 本函数只去掉内部压缩字段，不改变合法 tool_use/tool_result 结构。
+    """
+    if isinstance(block, dict):
+        return {
+            key: value
+            for key, value in block.items()
+            if not str(key).startswith("_")
+        }
+
+    # Pydantic v2 / Anthropic SDK object fallback
+    model_dump = getattr(block, "model_dump", None)
+    if callable(model_dump):
+        try:
+            data = model_dump()
+            if isinstance(data, dict):
+                return {
+                    key: value
+                    for key, value in data.items()
+                    if not str(key).startswith("_")
+                }
+        except Exception:
+            pass
+
+    block_type = getattr(block, "type", None)
+
+    if block_type == "text":
+        return {
+            "type": "text",
+            "text": str(getattr(block, "text", "") or ""),
+        }
+
+    if block_type == "tool_use":
+        return {
+            "type": "tool_use",
+            "id": str(getattr(block, "id", "") or ""),
+            "name": str(getattr(block, "name", "") or ""),
+            "input": getattr(block, "input", {}) or {},
+        }
+
+    if block_type == "tool_result":
+        data = {
+            "type": "tool_result",
+            "tool_use_id": str(getattr(block, "tool_use_id", "") or ""),
+            "content": getattr(block, "content", "") or "",
+        }
+        is_error = getattr(block, "is_error", None)
+        if is_error is not None:
+            data["is_error"] = bool(is_error)
+        return data
+
+    text = str(block).strip()
+    if not text:
+        return None
+    return {"type": "text", "text": text}
+
+
+def _content_to_api(content):
+    """规范化 message.content，保留 tool_use / tool_result block。"""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            converted = _block_to_api_dict(block)
+            if converted is not None:
+                blocks.append(converted)
+        return blocks
+
+    if content is None:
+        return ""
+
+    return str(content)
+
+
+def _tool_use_ids(msg: dict) -> list[str]:
+    """提取 assistant 消息里的 tool_use id。"""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+
+    ids: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool_id = str(block.get("id", "") or "").strip()
+            if tool_id:
+                ids.append(tool_id)
+    return ids
+
+
+def _tool_result_id(block: dict) -> str:
+    return str(block.get("tool_use_id", "") or "").strip()
+
+
+def _make_cancelled_tool_result(tool_use_id: str) -> dict:
+    """为被恢复/压缩打断的 tool_use 构造紧邻 placeholder。"""
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": "(cancelled)",
+    }
+
+
+def _merge_consecutive_same_role(messages: list[dict]) -> list[dict]:
+    """合并连续同 role 消息，保持 Anthropic 要求的 role 交替。"""
+    if not messages:
+        return []
+
+    merged = [messages[0]]
+
+    for msg in messages[1:]:
+        if msg["role"] != merged[-1]["role"]:
+            merged.append(msg)
+            continue
+
+        prev = merged[-1]
+        prev_c = prev["content"] if isinstance(prev["content"], list) else [
+            {"type": "text", "text": str(prev["content"])}
+        ]
+        curr_c = msg["content"] if isinstance(msg["content"], list) else [
+            {"type": "text", "text": str(msg["content"])}
+        ]
+        prev["content"] = prev_c + curr_c
+
+    return merged
+
+
+def _repair_tool_result_adjacency(messages: list[dict]) -> list[dict]:
+    """修复 tool_use / tool_result 邻接关系。
+
+    Anthropic 的硬性要求：tool_result 必须出现在紧跟上一条 assistant
+    tool_use 的 user 消息里，并且 tool_use_id 必须匹配上一条 assistant
+    消息中的 tool_use id。
+
+    这里做两件事：
+    1. 删除没有对应上一条 assistant tool_use 的 orphan tool_result。
+    2. 如果 assistant tool_use 后缺少 tool_result，插入紧邻的 cancelled placeholder。
+    """
+    repaired: list[dict] = []
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+
+        if msg.get("role") != "assistant":
+            # 普通 user 消息里的 orphan tool_result 必须移除，否则 API 400。
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                filtered = [
+                    block for block in msg["content"]
+                    if not (isinstance(block, dict) and block.get("type") == "tool_result")
+                ]
+                if filtered:
+                    new_msg = dict(msg)
+                    new_msg["content"] = filtered
+                    repaired.append(new_msg)
+            else:
+                repaired.append(msg)
+            i += 1
+            continue
+
+        repaired.append(msg)
+        expected_ids = _tool_use_ids(msg)
+
+        if not expected_ids:
+            i += 1
+            continue
+
+        next_msg = messages[i + 1] if i + 1 < len(messages) else None
+
+        if next_msg and next_msg.get("role") == "user":
+            content = next_msg.get("content")
+            blocks = content if isinstance(content, list) else [
+                {"type": "text", "text": str(content)}
+            ]
+
+            expected = set(expected_ids)
+            kept: list[dict] = []
+            seen_results: set[str] = set()
+
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    kept.append(block)
+                    continue
+
+                result_id = _tool_result_id(block)
+
+                if result_id in expected:
+                    kept.append(block)
+                    seen_results.add(result_id)
+                # else: 丢弃 orphan tool_result。
+
+            placeholders = [
+                _make_cancelled_tool_result(tool_id)
+                for tool_id in expected_ids
+                if tool_id not in seen_results
+            ]
+
+            new_user = dict(next_msg)
+            new_user["content"] = placeholders + kept
+
+            if _has_content(new_user):
+                repaired.append(new_user)
+
+            i += 2
+            continue
+
+        # assistant tool_use 后面没有 user tool_result，立即补一个 placeholder。
+        repaired.append({
+            "role": "user",
+            "content": [_make_cancelled_tool_result(tool_id) for tool_id in expected_ids],
+        })
+        i += 1
+
+    return repaired
+
+
 def normalize_messages(messages: list) -> list:
     """Clean up messages before sending to the API.
 
-    Three jobs:
-    1. Strip internal metadata fields the API doesn't understand
-    2. Ensure every tool_use has a matching tool_result (insert placeholder if missing)
-    3. Merge consecutive same-role messages (API requires strict alternation)
+    目标：
+    1. 去掉 API 不认识的内部 metadata 字段；
+    2. 保留 SDK object 形式的 tool_use/text block；
+    3. 保证 tool_result 紧邻并匹配上一条 assistant tool_use；
+    4. 合并连续同 role 消息，满足 API role alternation 要求。
     """
-    cleaned = []
+    cleaned: list[dict] = []
+
     for msg in messages:
-        clean = {"role": msg["role"]}
-        if isinstance(msg.get("content"), str):
-            clean["content"] = msg["content"]
-        elif isinstance(msg.get("content"), list):
-            clean["content"] = [
-                {k: v for k, v in block.items()
-                 if not k.startswith("_")}
-                for block in msg["content"]
-                if isinstance(block, dict)
-            ]
-        else:
-            clean["content"] = msg.get("content", "")
-        cleaned.append(clean)
-
-    # Collect existing tool_result IDs
-    existing_results = set()
-    for msg in cleaned:
-        if isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    existing_results.add(block.get("tool_use_id"))
-
-    # Find orphaned tool_use blocks and insert placeholder results
-    for msg in cleaned:
-        if msg["role"] != "assistant" or not isinstance(msg.get("content"), list):
+        role = msg.get("role")
+        if role not in {"user", "assistant"}:
             continue
-        for block in msg["content"]:
+
+        cleaned.append({
+            "role": role,
+            "content": _content_to_api(msg.get("content", "")),
+        })
+
+    cleaned = [msg for msg in cleaned if _has_content(msg)]
+    merged = _merge_consecutive_same_role(cleaned)
+    repaired = _repair_tool_result_adjacency(merged)
+    repaired = [msg for msg in repaired if _has_content(msg)]
+
+    return repaired
+
+
+def _has_content(msg: dict) -> bool:
+    """判断消息是否有可发给 API 的内容。
+
+    注意：tool_use 没有 text/content 字段，但它本身就是有效内容；旧逻辑会把
+    assistant tool_use 消息误删，导致下一条 user tool_result 变成 orphan。
+    """
+    content = msg.get("content")
+
+    if isinstance(content, str):
+        return bool(content.strip())
+
+    if isinstance(content, list):
+        for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and block.get("id") not in existing_results:
-                cleaned.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": block["id"],
-                     "content": "(cancelled)"}
-                ]})
 
-    # Merge consecutive same-role messages
-    if not cleaned:
-        return cleaned
-    merged = [cleaned[0]]
-    for msg in cleaned[1:]:
-        if msg["role"] == merged[-1]["role"]:
-            prev = merged[-1]
-            prev_c = prev["content"] if isinstance(prev["content"], list) \
-                else [{"type": "text", "text": str(prev["content"])}]
-            curr_c = msg["content"] if isinstance(msg["content"], list) \
-                else [{"type": "text", "text": str(msg["content"])}]
-            prev["content"] = prev_c + curr_c
-        else:
-            merged.append(msg)
-    return merged
+            block_type = block.get("type")
+
+            if block_type == "tool_use":
+                return bool(block.get("id") and block.get("name"))
+
+            if block_type == "tool_result":
+                return bool(block.get("tool_use_id"))
+
+            if block_type == "text":
+                if str(block.get("text", "")).strip():
+                    return True
+
+            if str(block.get("content", "")).strip():
+                return True
+
+    return False
+
 def make_safe_filename(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._")
     return safe or "subagent_summary"
@@ -275,14 +499,25 @@ def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
+
     try:
         cwd = STATE.get("yolo_path") or WORKDIR
-        r = subprocess.run(command, shell=True, cwd=cwd,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+        r = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def run_python(code: str) -> str:
@@ -290,12 +525,19 @@ def run_python(code: str) -> str:
     try:
         r = subprocess.run(
             ["python", "-c", code],
-            capture_output=True, text=True, timeout=30, cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=cwd,
         )
-        out = (r.stdout + r.stderr).strip()
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (30s)"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def run_read(path: str, limit: int = None) -> str:
@@ -316,7 +558,7 @@ def run_write(path: str, content: str, create: bool = False) -> str:
         if not fp.exists() and not create:
             return f"Error: file does not exist: {path}. Set create=True only if the task explicitly asks to create a new file."
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -325,10 +567,10 @@ def run_write(path: str, content: str, create: bool = False) -> str:
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = resolve_workspace_path(path)
-        content = fp.read_text()
+        content = fp.read_text(encoding="utf-8")
         if old_text not in content:
             return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text, 1))
+        fp.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"

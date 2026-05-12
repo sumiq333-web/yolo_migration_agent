@@ -1,7 +1,7 @@
 {
   "id": 1,
-  "subject": "Analyze YOLOv8 vs YOLOv10 backbone difference and produce change plan",
-  "description": "Compare yolov8.yaml and yolov10n.yaml backbone sections. Verify SCDown and PSA modules are registered in the model build path. Produce a change_plan artifact with the minimum YAML change needed to swap the backbone while keeping the YOLOv8 head/neck references valid.",
+  "subject": "Create change plan for replacing YOLOv10n backbone with YOLOv8 backbone",
+  "description": "Analyze YOLOv10n.yaml and YOLOv8.yaml backbones. Produce a change_plan detailing the minimal edits needed to replace the v10n backbone with v8 backbone while keeping v10n head/neck runnable. Key diffs: SCDown→Conv at backbone layers 5,7; remove PSA layer 10; adjust head 'from' indices for shifted backbone.",
   "status": "completed",
   "status_reason": "",
   "blockedBy": [],
@@ -11,24 +11,34 @@
   "owner": "engineer",
   "todos": [
     {
-      "activeForm": "Read and compare backbone YAMLs",
-      "content": "Read ultralytics/cfg/models/v8/yolov8.yaml and ultralytics/cfg/models/v10/yolov10n.yaml. Compare backbone sections layer by layer. Identify exact differences: layer types at each index, channel counts, and the additional PSA layer in YOLOv10.",
-      "status": "completed"
+      "content": "Resolve all target files: read ultralytics/cfg/models/v10/yolov10n.yaml and ultralytics/cfg/models/v8/yolov8.yaml. Also check if SCDown, PSA, Conv, C2fCIB, v10Detect are importable from ultralytics/nn/modules/__init__.py",
+      "status": "completed",
+      "activeForm": "Resolving target files and module imports"
     },
     {
-      "activeForm": "Verify SCDown and PSA module availability",
-      "content": "Verify that SCDown and PSA modules are importable in ultralytics/nn/modules/__init__.py and parseable by parse_model in ultralytics/nn/tasks.py. Confirm these modules will resolve at build time.",
-      "status": "completed"
+      "content": "Analyze backbone diff: identify every line-level difference between YOLOv10n backbone and YOLOv8 backbone (SCDown→Conv at layers 5,7; PSA layer 10 removal)",
+      "status": "completed",
+      "activeForm": "Analyzing backbone differences"
     },
     {
-      "activeForm": "Produce change_plan artifact",
-      "content": "Produce a change_plan artifact specifying: (1) exact lines to replace in ultralytics/cfg/models/v8/yolov8.yaml backbone section, (2) confirmation that YOLOv8 head references [4, 6, 9] remain valid with the YOLOv10 backbone (11 layers ending at index 10), (3) no changes needed to the head section. Artifact must include file_target, changes array, and verification_notes.",
-      "status": "completed"
+      "content": "Compute head index shifts: trace how head layer indices change when PSA is removed from backbone. Calculate new 'from' references for the Concat that connects to backbone P5 output",
+      "status": "completed",
+      "activeForm": "Computing head index adjustments"
+    },
+    {
+      "content": "Produce change_plan artifact: JSON with fields 'target_file', 'backbone_changes' (list of edits to backbone section), 'head_changes' (list of edits to head section), 'index_shift_explanation', and 'risk_notes'. Each change must specify old_text and new_text",
+      "status": "completed",
+      "activeForm": "Producing change_plan artifact",
+      "reason": "Auto-completed after successful submit of change_plan."
     }
   ],
   "workspace": "F:\\python\\yolov12-main",
   "cwd": "F:\\python\\yolov12-main",
   "allowed_roots": [
     "F:\\python\\yolov12-main"
-  ]
+  ],
+  "phase": "proposal",
+  "conclusion_type": "change_plan",
+  "authorization": "NO_WRITE",
+  "artifacts": []
 }

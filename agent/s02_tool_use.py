@@ -60,6 +60,11 @@ from agent.team_recovery import TeamRecovery
 from agent.tool_runtime import execute_tool_block
 from agent.model_runtime import call_model_with_recovery
 from agent.team_protocol import RequestStore
+from agent.artifact_protocol import (
+    parse_artifact_content,
+    normalize_artifact,
+    validate_artifact,
+)
 CRON_SCHEDULE_FILE = WORKSPACE_ROOT / ".schedules" / "scheduled_tasks.json"
 
 CRON_SCHEDULER = CronScheduler(
@@ -267,10 +272,14 @@ def _build_dispatch_content(kw: dict) -> str:
     header = {
         "task_id": task["id"],
         "subject": task["subject"],
+        "phase": task.get("phase", ""),
+        "conclusion_type": task.get("conclusion_type", ""),
+        "authorization": task.get("authorization", "NO_WRITE"),
         "workspace": task.get("workspace", ""),
         "cwd": task.get("cwd", task.get("workspace", "")),
         "allowed_roots": task.get("allowed_roots", []),
         "todos": task.get("todos", []),
+        "artifacts": task.get("artifacts", []),
     }
     return (
         f"<task-context>\n"
@@ -601,6 +610,18 @@ TOOLS = [
                         "subject": {"type": "string"},
                         "description": {"type": "string"},
                         "owner": {"type": "string"},
+                        "phase": {
+                            "type": "string",
+                            "description": "Task phase, e.g. planning/review/implementation/validation.",
+                        },
+                        "conclusion_type": {
+                            "type": "string",
+                            "description": "Expected final artifact type, e.g. change_plan/review_result/validation_result.",
+                        },
+                        "authorization": {
+                            "type": "string",
+                            "description": "Write authorization boundary, e.g. NO_WRITE or WRITE_APPROVED.",
+                        },
                     },
                     "required": ["key", "subject"],
                 },
@@ -1097,6 +1118,137 @@ def init_team_manager():
 
     TEAM_MANAGER.reload_config()
 
+RESULT_MSG_TYPES = {
+    "task_result",
+    "change_plan",
+    "review_result",
+    "validation_result",
+    "experiment_result",
+    "implementation_result",
+}
+
+
+def _extract_task_context_from_content(content: str) -> dict:
+    """从 dispatch content 里的 <task-context> 中恢复 task 协议上下文。"""
+    import re
+
+    match = re.search(r"<task-context>\s*(.*?)\s*</task-context>", str(content or ""), re.DOTALL)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _request_task_context(request_id: str) -> dict:
+    """从 RequestStore 中取出原始 dispatch task-context。"""
+    if not request_id:
+        return {}
+    try:
+        request = REQUEST_STORE.get_request(request_id)
+    except ValueError:
+        return {}
+    return _extract_task_context_from_content(request.get("content", ""))
+
+
+def _message_task_id(message: dict, request_id: str) -> int | None:
+    """优先使用 teammate 消息里的 task_id，缺失时从 request 的 task-context 兜底恢复。"""
+    raw = message.get("task_id")
+    if raw is None:
+        raw = _request_task_context(request_id).get("task_id")
+    if raw is None:
+        artifact = parse_artifact_content(message.get("content", ""))
+        raw = artifact.get("task_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _artifact_type_from_message(msg_type: str, artifact: dict) -> str:
+    """task_result 可以携带 artifact_type；专用 submit_* 消息直接以 msg_type 作为 artifact_type。"""
+    if msg_type == "task_result":
+        return str(artifact.get("artifact_type", "task_result")).strip()
+    return msg_type
+
+
+def _complete_result_message(request_id: str, message: dict, content: str, payload: dict) -> None:
+    """同步 teammate result。若 task.conclusion_type 非空，则必须通过 artifact 验收。"""
+    msg_type = str(message.get("type", ""))
+    task_id = _message_task_id(message, request_id)
+
+    # 没有关联 task 的历史消息：保持旧行为，直接完成 request。
+    if task_id is None:
+        REQUEST_STORE.complete_request(
+            request_id=request_id,
+            result=content,
+            payload=payload,
+        )
+        return
+
+    try:
+        task = TASK_MANAGER.get(task_id)
+    except ValueError:
+        REQUEST_STORE.fail_request(
+            request_id=request_id,
+            reason=f"Result references missing task #{task_id}.",
+            payload=payload,
+        )
+        return
+
+    expected_type = str(task.get("conclusion_type", "")).strip()
+
+    # conclusion_type 为空表示这个 task 不要求结构化 artifact，兼容旧 task_result。
+    if not expected_type:
+        REQUEST_STORE.complete_request(
+            request_id=request_id,
+            result=content,
+            payload=payload,
+        )
+        return
+
+    artifact = parse_artifact_content(content)
+    artifact_type = _artifact_type_from_message(msg_type, artifact)
+    artifact = normalize_artifact(
+        artifact,
+        artifact_type=artifact_type,
+        task_id=task_id,
+    )
+    artifact.setdefault("request_id", request_id)
+    artifact.setdefault("producer", message.get("from", ""))
+
+    ok, reason, normalized = validate_artifact(
+        artifact,
+        expected_type=expected_type,
+    )
+
+    if not ok:
+        REQUEST_STORE.fail_request(
+            request_id=request_id,
+            reason=f"Artifact validation failed: {reason}",
+            payload={**payload, "artifact": normalized},
+        )
+        return
+
+    try:
+        TASK_MANAGER.append_artifact(task_id, normalized)
+    except ValueError as e:
+        REQUEST_STORE.fail_request(
+            request_id=request_id,
+            reason=f"Failed to persist artifact: {e}",
+            payload={**payload, "artifact": normalized},
+        )
+        return
+
+    REQUEST_STORE.complete_request(
+        request_id=request_id,
+        result=json.dumps(normalized, ensure_ascii=False, indent=2),
+        payload={**payload, "artifact": normalized},
+    )
+
+
 def sync_requests_from_lead_inbox(inbox: list[dict]) -> None:
     for message in inbox:
         request_id = message.get("request_id")
@@ -1112,10 +1264,11 @@ def sync_requests_from_lead_inbox(inbox: list[dict]) -> None:
         }
 
         try:
-            if msg_type == "task_result":
-                REQUEST_STORE.complete_request(
+            if msg_type in RESULT_MSG_TYPES:
+                _complete_result_message(
                     request_id=request_id,
-                    result=content,
+                    message=message,
+                    content=content,
                     payload=payload,
                 )
 
@@ -1232,6 +1385,28 @@ def _has_active_tasks() -> bool:
             pass
     return False
 
+def _should_stop_after_lead_tools(executions) -> bool:
+    """
+    lead 工具批次后的停止条件。
+
+    目的：
+    1. dispatch_to_teammate 成功后，立即交还控制权给外层 wait_for_lead。
+    2. read_inbox 执行后，如果仍有 active task，也停止本轮，避免 lead 主动轮询空 inbox。
+    """
+    for execution in executions:
+        tool_name = getattr(execution, "tool_name", "")
+        status = getattr(execution, "status", "")
+
+        if status != "executed":
+            continue
+
+        if tool_name == "dispatch_to_teammate" and _has_active_tasks():
+            return True
+
+        if tool_name == "read_inbox" and _has_active_tasks():
+            return True
+
+    return False
 
 def agent_loop(messages: list):
     # 每次用户输入都会重新进入 agent_loop，重置汇报状态。
@@ -1294,6 +1469,7 @@ def agent_loop(messages: list):
                 prompt_dirty_fn=maybe_mark_prompt_dirty,
                 log_fn=print,
                 after_tool_batch_fn=lead_after_tool_batch,
+                stop_after_tool_fn=_should_stop_after_lead_tools,
             )
         )
 
@@ -1323,7 +1499,7 @@ def agent_loop(messages: list):
             return
 
         # 仍有非 terminal 任务，等待 teammate 消息再继续。
-        TEAM_BUS.wait_for_lead(timeout=10)
+        TEAM_BUS.wait_for_lead(timeout=1000000)
 
 
 def extract_text_blocks(content) -> list[str]:

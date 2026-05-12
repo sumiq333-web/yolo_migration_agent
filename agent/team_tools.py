@@ -149,6 +149,34 @@ def build_engineer_profile(
             },
         },
         {
+            "name": "submit_change_plan",
+            "description": "Submit the final change_plan artifact for your assigned task. This is the required final action when task.conclusion_type=change_plan.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact": {
+                        "type": "object",
+                        "description": "Structured change_plan artifact. Include summary and changes or plan.",
+                    },
+                },
+                "required": ["artifact"],
+            },
+        },
+        {
+            "name": "submit_implementation_result",
+            "description": "Submit the final implementation_result artifact for your assigned implementation task.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact": {
+                        "type": "object",
+                        "description": "Structured implementation_result artifact. Include status, files_changed or files_verified, summary, and validation_notes.",
+                    },
+                },
+                "required": ["artifact"],
+            },
+        },
+        {
             "name": "send_message",
             "description": "Send a task result or question to lead.",
             "input_schema": {
@@ -236,6 +264,25 @@ def build_engineer_profile(
         "todo_update": lambda sender, **kw: _handle_todo_update(
             sender, task_manager, get_task_id_fn, kw["index"], kw["status"], kw.get("reason", "")
         ),
+    #     "submit_change_plan": lambda sender, **kw: bus.send(
+    #     sender=sender,
+    #     to="lead",
+    #     content=json.dumps(
+    #         {
+    #             **kw.get("artifact", {}),
+    #             "artifact_type": "change_plan",
+    #             "producer": sender,
+    #             **(
+    #                 {"task_id": int(get_task_id_fn(sender))}
+    #                 if get_task_id_fn and get_task_id_fn(sender) is not None
+    #                 else {}
+    #             ),
+    #         },
+    #         ensure_ascii=False,
+    #         indent=2,
+    #     ),
+    #     msg_type="task_result",
+    # ),
         "send_message": lambda sender, **kw: bus.send(
             sender=sender,
             to="lead",
@@ -286,9 +333,25 @@ def build_reviewer_profile(
     tools = []
 
     for tool in base.tools:
-        if tool["name"] in MUTATING_TOOLS:
+        if tool["name"] in MUTATING_TOOLS or tool["name"] == "submit_change_plan":
             continue
         if tool["name"] == "send_message":
+            tools.append(
+                {
+                    "name": "submit_review_result",
+                    "description": "Submit the final review_result artifact for your assigned review task.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "artifact": {
+                                "type": "object",
+                                "description": "Structured review_result artifact. Include decision and summary.",
+                            },
+                        },
+                        "required": ["artifact"],
+                    },
+                }
+            )
             tools.append(
                 {
                     "name": "send_message",
@@ -310,6 +373,12 @@ def build_reviewer_profile(
             tools.append(tool)
 
     handlers = dict(base.handlers)
+    handlers["submit_review_result"] = lambda sender, **kw: bus.send(
+        sender=sender,
+        to="lead",
+        content=json.dumps(kw.get("artifact", {}), ensure_ascii=False, indent=2),
+        msg_type="review_result",
+    )
     handlers["send_message"] = lambda sender, **kw: bus.send(
         sender=sender,
         to="lead",
@@ -351,6 +420,20 @@ def build_experiment_runner_profile(
                     },
                 },
                 "required": ["content"],
+            },
+        },
+        {
+            "name": "submit_validation_result",
+            "description": "Submit the final validation_result artifact for your assigned validation task.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact": {
+                        "type": "object",
+                        "description": "Structured validation_result artifact. Include summary/status/result.",
+                    },
+                },
+                "required": ["artifact"],
             },
         },
         {
@@ -431,6 +514,12 @@ def build_experiment_runner_profile(
             content=kw["content"],
             msg_type=kw.get("msg_type", "experiment_result"),
         ),
+        # "submit_validation_result": lambda sender, **kw: bus.send(
+        #     sender=sender,
+        #     to="lead",
+        #     content=json.dumps(kw.get("artifact", {}), ensure_ascii=False, indent=2),
+        #     msg_type="validation_result",
+        # ),
         "read_inbox": lambda sender, **kw: json.dumps(
             bus.read_inbox(sender),
             ensure_ascii=False,

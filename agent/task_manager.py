@@ -42,6 +42,15 @@ class TaskRecord:
     cwd: str = ""
     allowed_roots: list[str] = field(default_factory=list)
 
+    # 协议字段：用于约束 teammate 产物和写权限。
+    # phase: planning / review / implementation / validation 等，runtime 不强制枚举，避免过度绑定业务。
+    # conclusion_type: 该 task 期望 teammate 最终提交的 artifact 类型，例如 change_plan/review_result。
+    # authorization: NO_WRITE / WRITE_APPROVED 等，由 lead 明确授予，teammate 不能自行推断。
+    phase: str = ""
+    conclusion_type: str = ""
+    authorization: str = "NO_WRITE"
+    artifacts: list[dict] = field(default_factory=list)
+
     def is_ready(self) -> bool:
         return self.status == "pending" and not self.blockedBy
 
@@ -120,7 +129,15 @@ class TaskManager:
 
     # ---------- public query API ----------
 
-    def create(self, subject: str, description: str = "", owner: str = "") -> dict:
+    def create(
+            self,
+            subject: str,
+            description: str = "",
+            owner: str = "",
+            phase: str = "",
+            conclusion_type: str = "",
+            authorization: str = "NO_WRITE",
+    ) -> dict:
         subject = subject.strip()
         if not subject:
             raise ValueError("Task subject is required")
@@ -130,6 +147,9 @@ class TaskManager:
             subject=subject,
             description=description.strip(),
             owner=owner.strip(),
+            phase=str(phase or "").strip(),
+            conclusion_type=str(conclusion_type or "").strip(),
+            authorization=str(authorization or "NO_WRITE").strip() or "NO_WRITE",
         )
 
         self._save(task)
@@ -343,6 +363,20 @@ class TaskManager:
     def assign(self, task_id: int, owner: str) -> dict:
         task = self._load(task_id)
         task.owner = owner.strip()
+        self._save(task)
+        return self._to_public(task)
+
+    def append_artifact(self, task_id: int, artifact: dict) -> dict:
+        """把通过 request-level 验收的 artifact 持久化到 task。
+
+        注意：这里不决定 task completed/failed；task 状态仍必须由 lead 通过
+        task_set_status 显式决策。
+        """
+        task = self._load(task_id)
+        if not isinstance(artifact, dict):
+            raise ValueError("artifact must be a dict")
+
+        task.artifacts.append(dict(artifact))
         self._save(task)
         return self._to_public(task)
 
@@ -561,10 +595,14 @@ class TaskManager:
             blocked = f" blockedBy={task.blockedBy}" if task.blockedBy else ""
             blocks = f" blocks={task.blocks}" if task.blocks else ""
             owner = f" owner={task.owner}" if task.owner else ""
+            phase = f" phase={task.phase}" if task.phase else ""
+            conclusion = f" conclusion_type={task.conclusion_type}" if task.conclusion_type else ""
+            authorization = f" authorization={task.authorization}" if task.authorization else ""
+            artifacts = f" artifacts={len(task.artifacts)}" if task.artifacts else ""
             reason = f" reason={task.status_reason}" if task.status_reason else ""
             lines.append(
                 f"{marker} #{task.id}: {task.subject}"
-                f"{owner}{blocked}{blocks}{reason}"
+                f"{owner}{phase}{conclusion}{authorization}{artifacts}{blocked}{blocks}{reason}"
             )
 
         return "\n".join(lines)
@@ -649,6 +687,9 @@ class TaskManager:
                 subject=str(item["subject"]).strip(),
                 description=str(item.get("description", "")).strip(),
                 owner=str(item.get("owner", "")).strip(),
+                phase=str(item.get("phase", "")).strip(),
+                conclusion_type=str(item.get("conclusion_type", "")).strip(),
+                authorization=str(item.get("authorization", "NO_WRITE")).strip() or "NO_WRITE",
             )
 
             key_to_id[key] = created_task["id"]

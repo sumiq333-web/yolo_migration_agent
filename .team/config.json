@@ -5,28 +5,34 @@
       "name": "engineer",
       "role": "code engineer",
       "tool_profile": "engineer",
-      "instructions": "Directly responsible for all code-related work: repository inspection, model architecture analysis, migration planning, change_plan artifacts, and implementation after lead issues WRITE_APPROVED. If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; do not finish with natural language or manually composed JSON. Do not write code unless the task phase and authorization allow it. Do not decide task status.",
+      "instructions": "Directly responsible for all code-related work: repository inspection, model architecture analysis, migration planning, change_plan artifacts, and implementation after lead issues WRITE_APPROVED. If task.conclusion_type=change_plan, the final action MUST be submit_change_plan; If task.conclusion_type=implementation_result, the final action MUST be submit_implementation_result.do not finish with natural language or manually composed JSON. Do not write code unless the task phase and authorization allow it. Do not decide task status.",
       "status": "idle",
       "created_at": 1778479697.9173882,
-      "updated_at": 1778481958.212831
+      "updated_at": 1778556193.1606212,
+      "previous_status": "working",
+      "recovered_at": 1778495590.1243427
     },
     {
       "name": "reviewer",
       "role": "technical reviewer",
       "tool_profile": "reviewer",
-      "instructions": "Independently review source_artifacts forwarded by lead, including change_plan artifacts and implementation results. Submit review_result with decision=approve, request_changes, or reject. Do not write code, do not authorize writes, and do not decide task status.",
-      "status": "working",
+      "instructions": "Independently review source_artifacts forwarded by lead, including change_plan artifacts and implementation results. If task.conclusion_type=review_result, the final action MUST be submit_review_result with decision=approve, request_changes, or reject. Do not write code, do not authorize writes, and do not decide task status",
+      "status": "idle",
       "created_at": 1778479697.9173882,
-      "updated_at": 1778482858.1737187
+      "updated_at": 1778556859.8033805,
+      "previous_status": "working",
+      "recovered_at": 1778492122.7389572
     },
     {
       "name": "experiment_runner",
       "role": "validation executor",
       "tool_profile": "experiment_runner",
-      "instructions": "Run or summarize validation work assigned by lead, including tests, training smoke tests, model build checks, command verification, logs, metrics, and failure reasons. If task.conclusion_type=validation_result, submit a valid validation_result artifact. Do not change source files unless explicitly authorized by lead.",
+      "instructions": "Run or summarize validation work assigned by lead, including tests, training smoke tests, model build checks, command verification, logs, metrics, and failure reasons. If task.conclusion_type=validation_result, the final action MUST be submit_validation_result with a valid validation_result artifact. Do not change source files unless explicitly authorized by lead.",
       "status": "idle",
       "created_at": 1778479697.9173882,
-      "updated_at": 1778479697.9173882
+      "updated_at": 1778552924.5634003,
+      "previous_status": "working",
+      "recovered_at": 1778552924.5634003
     }
   ]
 }
